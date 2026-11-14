@@ -1,0 +1,959 @@
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# cal.st — Unix calendar utility in Strata (derived from util-linux misc-utils/cal.c)
+# Copyright (c) 1989, 1993, 1994 The Regents of the University of California.
+#
+# Supports:
+#   -1 / --one, -3 / --three, -n <months>, -S / --span
+#   -s (Sunday), -m (Monday), -t (Saturday), -j (Julian day-of-year)
+#   -y / --year, -Y / --twelve, -w[=week] (US / ISO-8601 week numbers)
+#   -v / --vertical, -c <cols>, --reform <1752|gregorian|iso|julian>, --iso, --color
+
+import sys/types.h
+import ctype.h
+import getopt.h
+import stdint.h
+import stdbool.h
+import stdio.h
+import stdlib.h
+import string.h
+import strings.h
+import time.h
+import unistd.h
+import errno.h
+import limits.h
+
+define DOY_MONTH_WIDTH 27
+define DOM_MONTH_WIDTH 20
+
+define REFORMATION_MONTH 9
+define NUMBER_MISSING_DAYS 11
+define YDAY_AFTER_MISSING 258
+
+define MONTHS_IN_YEAR 12
+define DAYS_IN_MONTH 31
+define MAXDAYS 42
+define SPACE -1
+define SMALLEST_YEAR 1
+
+define DAY_LEN 3
+define DAYS_IN_WEEK 7
+define WEEK_LEN 21
+define MONTHS_IN_YEAR_ROW 3
+define WNUM_LEN 3
+define FMT_ST_CHARS 300
+
+define GREGORIAN INT32_MIN
+define ISO INT32_MIN
+define GB1752 1752
+define DEFAULT_REFORM_YEAR 1752
+define JULIAN INT32_MAX
+
+enum Weekday:
+    SUNDAY = 0
+    MONDAY = 1
+    TUESDAY = 2
+    WEDNESDAY = 3
+    THURSDAY = 4
+    FRIDAY = 5
+    SATURDAY = 6
+    NONEDAY = 8
+
+enum MonthIndex:
+    JANUARY = 1
+    FEBRUARY = 2
+    MARCH = 3
+    APRIL = 4
+    MAY = 5
+    JUNE = 6
+    JULY = 7
+    AUGUST = 8
+    SEPTEMBER = 9
+    OCTOBER = 10
+    NOVEMBER = 11
+    DECEMBER = 12
+
+enum WeekNumFlags:
+    WEEK_NUM_DISABLED = 0
+    WEEK_NUM_MASK = 255
+    WEEK_NUM_ISO = 256
+    WEEK_NUM_US = 512
+
+enum ColumnMode:
+    COLUMNS_MAX_THREE = -1
+    COLUMNS_AUTO = -2
+
+enum ColorId:
+    CAL_COLOR_TODAY = 0
+    CAL_COLOR_HEADER = 1
+    CAL_COLOR_WEEKNUMBER = 2
+    CAL_COLOR_WEEKS = 3
+    CAL_COLOR_WORKDAY = 4
+    CAL_COLOR_WEEKEND = 5
+
+static day_headings: char[133]
+static use_color: bool = false
+
+struct cal_request:
+    day: i32
+    month: i32
+    year: i32
+    week: i32
+    start_month: i32
+
+struct cal_control:
+    full_month: cstr[12]
+    abbr_month: cstr[12]
+    weekdays: cstr[7]
+    reform_year: i32
+    colormode: i32
+    num_months: i32
+    span_months: i32
+    months_in_row: i32
+    weekstart: i32
+    weektype: i32
+    day_width: usize
+    week_width: usize
+    month_width: usize
+    gutter_width: i32
+    req: struct cal_request
+    julian: bool
+    header_year: bool
+    header_hint: bool
+    vertical: bool
+
+struct cal_month:
+    days: i32[42]
+    weeks: i32[6]
+    month: i32
+    year: i32
+    next: struct cal_month*
+
+static def days_in_month_lookup(leap: i32, month: i32) -> i32:
+    if month < 1 or month > 12:
+        return 0
+    if month == 2:
+        if leap != 0:
+            return 29
+        return 28
+    if month == 4 or month == 6 or month == 9 or month == 11:
+        return 30
+    return 31
+
+static inline def cal_get_color_sequence(id: i32) -> cstr:
+    if not use_color:
+        return ""
+    if id == CAL_COLOR_TODAY or id == CAL_COLOR_WEEKNUMBER:
+        return "\033[7m"
+    return ""
+
+static inline def cal_get_color_disable_sequence(id: i32) -> cstr:
+    seq: cstr = cal_get_color_sequence(id)
+    if seq != nil and seq[0] != '\0':
+        return "\033[0m"
+    return ""
+
+static inline def cal_enable_color(id: i32):
+    seq: cstr = cal_get_color_sequence(id)
+    if seq != nil and seq[0] != '\0':
+        fputs(seq, stdout)
+
+static inline def cal_disable_color(id: i32):
+    seq: cstr = cal_get_color_disable_sequence(id)
+    if seq != nil and seq[0] != '\0':
+        fputs(seq, stdout)
+
+static inline def fput_seq(s: cstr):
+    if s != nil and s[0] != '\0':
+        fputs(s, stdout)
+
+# Leap year -- account for Gregorian reformation in 1752
+static def leap_year(ctl: const struct cal_control*, year: i32) -> i32:
+    if year <= ctl->reform_year:
+        return not (year % 4)
+    return (not (year % 4) and (year % 100)) or not (year % 400)
+
+static def init_monthnames(ctl: struct cal_control*):
+    if ctl->full_month[0] != nil:
+        return
+    ctl->full_month[0] = "January"
+    ctl->full_month[1] = "February"
+    ctl->full_month[2] = "March"
+    ctl->full_month[3] = "April"
+    ctl->full_month[4] = "May"
+    ctl->full_month[5] = "June"
+    ctl->full_month[6] = "July"
+    ctl->full_month[7] = "August"
+    ctl->full_month[8] = "September"
+    ctl->full_month[9] = "October"
+    ctl->full_month[10] = "November"
+    ctl->full_month[11] = "December"
+
+static def init_abbr_monthnames(ctl: struct cal_control*):
+    if ctl->abbr_month[0] != nil:
+        return
+    ctl->abbr_month[0] = "Jan"
+    ctl->abbr_month[1] = "Feb"
+    ctl->abbr_month[2] = "Mar"
+    ctl->abbr_month[3] = "Apr"
+    ctl->abbr_month[4] = "May"
+    ctl->abbr_month[5] = "Jun"
+    ctl->abbr_month[6] = "Jul"
+    ctl->abbr_month[7] = "Aug"
+    ctl->abbr_month[8] = "Sep"
+    ctl->abbr_month[9] = "Oct"
+    ctl->abbr_month[10] = "Nov"
+    ctl->abbr_month[11] = "Dec"
+
+static def monthname_to_number(ctl: struct cal_control*, name: cstr) -> i32:
+    init_monthnames(ctl)
+    for i: i32 = 0; i < MONTHS_IN_YEAR; i++:
+        if strcasecmp(ctl->full_month[i], name) == 0:
+            return i + 1
+    init_abbr_monthnames(ctl)
+    for i: i32 = 0; i < MONTHS_IN_YEAR; i++:
+        if strcasecmp(ctl->abbr_month[i], name) == 0:
+            return i + 1
+    return -EINVAL
+
+static def weekdays_init(ctl: struct cal_control*):
+    names: cstr[7]
+    names[0] = "Su"
+    names[1] = "Mo"
+    names[2] = "Tu"
+    names[3] = "We"
+    names[4] = "Th"
+    names[5] = "Fr"
+    names[6] = "Sa"
+    for i: i32 = 0; i < DAYS_IN_WEEK; i++:
+        wd: i32 = (i + ctl->weekstart) % DAYS_IN_WEEK
+        ctl->weekdays[i] = names[wd]
+
+static def center_str(src: cstr, dest: str, dest_size: usize, width: usize) -> i32:
+    len: usize = strlen(src)
+    if len > width:
+        len = width
+    spaces: usize = width - len
+    left_pad: usize = spaces / 2
+    right_pad: usize = spaces - left_pad
+    pos: usize = 0
+    for i: usize = 0; i < left_pad and pos + 1 < dest_size; i++:
+        dest[pos++] = ' '
+    for i: usize = 0; i < len and pos + 1 < dest_size; i++:
+        dest[pos++] = src[i]
+    for i: usize = 0; i < right_pad and pos + 1 < dest_size; i++:
+        dest[pos++] = ' '
+    dest[pos] = '\0'
+    return (i32)pos
+
+static def center(s: cstr, len: usize, separate: i32):
+    lineout: char[300]
+    center_str(s, lineout, sizeof(lineout), len)
+    fputs(lineout, stdout)
+    if separate != 0:
+        printf("%*s", separate, "")
+
+static def left_str(src: cstr, dest: str, dest_size: usize, width: usize) -> i32:
+    len: usize = strlen(src)
+    if len > width:
+        len = width
+    right_pad: usize = width - len
+    pos: usize = 0
+    for i: usize = 0; i < len and pos + 1 < dest_size; i++:
+        dest[pos++] = src[i]
+    for i: usize = 0; i < right_pad and pos + 1 < dest_size; i++:
+        dest[pos++] = ' '
+    dest[pos] = '\0'
+    return (i32)pos
+
+static def left(s: cstr, len: usize, separate: i32):
+    lineout: char[300]
+    left_str(s, lineout, sizeof(lineout), len)
+    fputs(lineout, stdout)
+    if separate != 0:
+        printf("%*s", separate, "")
+
+static def headers_init(ctl: struct cal_control*):
+    cur_dh: str = day_headings
+    tmp: char[300]
+    day_headings[0] = '\0'
+    year_len: i32 = snprintf(tmp, sizeof(tmp), "%04d", ctl->req.year)
+    if year_len < 0 or (usize)year_len >= sizeof(tmp):
+        return
+    for i: usize = 0; i < DAYS_IN_WEEK; i++:
+        space_left: usize = sizeof(day_headings) - (usize)(cur_dh - day_headings)
+        if i > 0 and space_left > 1:
+            *cur_dh++ = ' '
+            *cur_dh = '\0'
+            space_left--
+        if space_left <= ctl->day_width - 1:
+            break
+        cur_dh += center_str(ctl->weekdays[i], cur_dh, space_left, ctl->day_width - 1)
+    init_monthnames(ctl)
+    for i: usize = 0; i < MONTHS_IN_YEAR; i++:
+        if ctl->week_width < strlen(ctl->full_month[i]) + (usize)year_len:
+            ctl->header_hint = true
+
+# Return the 1-based day number within the year
+static def day_in_year(ctl: const struct cal_control*, day: i32, month: i32, year: i32) -> i32:
+    leap: i32 = leap_year(ctl, year)
+    for i: i32 = 1; i < month; i++:
+        day += days_in_month_lookup(leap, i)
+    return day
+
+# Return the 0-based weekday for any date from 1 Jan 1 to 31 Dec 9999.
+# Assumes the Gregorian reformation eliminates 3 Sep 1752 through 13 Sep 1752.
+static def day_in_week(ctl: const struct cal_control*, day: i32, month: i32, year: i32) -> i32:
+    reform: i32[12]
+    reform[0] = 0
+    reform[1] = 3
+    reform[2] = 2
+    reform[3] = 5
+    reform[4] = 0
+    reform[5] = 3
+    reform[6] = 5
+    reform[7] = 1
+    reform[8] = 4
+    reform[9] = 6
+    reform[10] = 2
+    reform[11] = 4
+
+    old: i32[12]
+    old[0] = 5
+    old[1] = 1
+    old[2] = 0
+    old[3] = 3
+    old[4] = 5
+    old[5] = 1
+    old[6] = 3
+    old[7] = 6
+    old[8] = 2
+    old[9] = 4
+    old[10] = 0
+    old[11] = 2
+
+    if month > 12:
+        month = 12
+    if year != ctl->reform_year + 1:
+        year -= month < MARCH
+    else:
+        year -= (month < MARCH) + 14
+
+    if ctl->reform_year < year or (year == ctl->reform_year and REFORMATION_MONTH < month) or (year == ctl->reform_year and month == REFORMATION_MONTH and 13 < day):
+        d64: i64 = (i64)year + (year / 4) - (year / 100) + (year / 400) + reform[month - 1] + day
+        return (i32)(d64 % DAYS_IN_WEEK)
+
+    if year < ctl->reform_year or (year == ctl->reform_year and month < REFORMATION_MONTH) or (year == ctl->reform_year and month == REFORMATION_MONTH and day < 3):
+        d64: i64 = (i64)year + year / 4 + old[month - 1] + day
+        return (i32)(d64 % DAYS_IN_WEEK)
+
+    return NONEDAY
+
+# Return the week number of a given date (1..54), supporting ISO-8601 and US modes
+static def week_number(day: i32, month: i32, year: i32, ctl: const struct cal_control*) -> i32:
+    fday: i32 = 0
+    wday: i32 = day_in_week(ctl, 1, JANUARY, year)
+    if (ctl->weektype & WEEK_NUM_ISO) != 0:
+        if wday >= FRIDAY:
+            fday = wday - 2
+        else:
+            fday = wday + 5
+    else:
+        wday_offset: i32 = (wday - ctl->weekstart + DAYS_IN_WEEK) % DAYS_IN_WEEK
+        fday = 6 + wday_offset
+
+    if day > DAYS_IN_MONTH:
+        month = JANUARY
+
+    yday: i32 = day_in_year(ctl, day, month, year)
+    if year == ctl->reform_year and yday >= YDAY_AFTER_MISSING:
+        fday -= NUMBER_MISSING_DAYS
+
+    if yday + fday < DAYS_IN_WEEK:
+        return week_number(31, DECEMBER, year - 1, ctl)
+
+    if ctl->weektype == WEEK_NUM_ISO and yday >= 363 and day_in_week(ctl, day, month, year) >= MONDAY and day_in_week(ctl, day, month, year) <= WEDNESDAY and day_in_week(ctl, 31, DECEMBER, year) >= MONDAY and day_in_week(ctl, 31, DECEMBER, year) <= WEDNESDAY:
+        return week_number(1, JANUARY, year + 1, ctl)
+
+    return (yday + fday) / DAYS_IN_WEEK
+
+static def week_to_day(ctl: const struct cal_control*) -> i32:
+    wday: i32 = day_in_week(ctl, 1, JANUARY, ctl->req.year)
+    yday: i32 = 0
+    if (ctl->weektype & WEEK_NUM_ISO) != 0:
+        yday = ctl->req.week * DAYS_IN_WEEK - wday
+        if wday >= FRIDAY:
+            yday -= -2
+        else:
+            yday -= 5
+    else:
+        wday_offset: i32 = (wday - ctl->weekstart + DAYS_IN_WEEK) % DAYS_IN_WEEK
+        yday = ctl->req.week * DAYS_IN_WEEK - (6 + wday_offset)
+
+    if ctl->req.year == ctl->reform_year and yday >= YDAY_AFTER_MISSING:
+        yday += NUMBER_MISSING_DAYS
+    if yday <= 0:
+        return 1
+    return yday
+
+static def cal_fill_month(month: struct cal_month*, ctl: const struct cal_control*):
+    first_week_day: i32 = day_in_week(ctl, 1, month->month, month->year)
+    j: i32 = 1
+    if ctl->julian:
+        j = day_in_year(ctl, 1, month->month, month->year)
+    month_days: i32 = j + days_in_month_lookup(leap_year(ctl, month->year), month->month)
+
+    first_week_day = (first_week_day - ctl->weekstart + DAYS_IN_WEEK) % DAYS_IN_WEEK
+    weeklines: i32 = 0
+
+    for i: i32 = 0; i < MAXDAYS; i++:
+        if 0 < first_week_day:
+            month->days[i] = SPACE
+            first_week_day--
+            continue
+        if j < month_days:
+            if month->year == ctl->reform_year and month->month == REFORMATION_MONTH and (j == 3 or j == 247):
+                j += NUMBER_MISSING_DAYS
+            month->days[i] = j
+            j++
+            continue
+        month->days[i] = SPACE
+        weeklines++
+
+    if ctl->weektype != 0:
+        weeknum: i32 = week_number(1, month->month, month->year, ctl)
+        weeklines = MAXDAYS / DAYS_IN_WEEK - weeklines / DAYS_IN_WEEK
+        for i: i32 = 0; i < MAXDAYS / DAYS_IN_WEEK; i++:
+            if 0 < weeklines:
+                if 52 < weeknum:
+                    weeknum = week_number(month->days[i * DAYS_IN_WEEK], month->month, month->year, ctl)
+                month->weeks[i] = weeknum++
+            else:
+                month->weeks[i] = SPACE
+            weeklines--
+
+static def cal_output_header(month: struct cal_month*, ctl: const struct cal_control*):
+    out: char[300]
+    if ctl->header_hint or ctl->header_year:
+        cal_enable_color(CAL_COLOR_HEADER)
+        for i: struct cal_month* = month; i != nil; i = i->next:
+            snprintf(out, sizeof(out), "%s", ctl->full_month[i->month - 1])
+            sep: i32 = ctl->gutter_width
+            if i->next == nil:
+                sep = 0
+            center(out, ctl->week_width, sep)
+        cal_disable_color(CAL_COLOR_HEADER)
+
+        if not ctl->header_year:
+            fputc('\n', stdout)
+            cal_enable_color(CAL_COLOR_HEADER)
+            for i: struct cal_month* = month; i != nil; i = i->next:
+                snprintf(out, sizeof(out), "%04d", i->year)
+                sep: i32 = ctl->gutter_width
+                if i->next == nil:
+                    sep = 0
+                center(out, ctl->week_width, sep)
+            cal_disable_color(CAL_COLOR_HEADER)
+    else:
+        cal_enable_color(CAL_COLOR_HEADER)
+        for i: struct cal_month* = month; i != nil; i = i->next:
+            snprintf(out, sizeof(out), "%s %04d", ctl->full_month[i->month - 1], i->year)
+            sep: i32 = ctl->gutter_width
+            if i->next == nil:
+                sep = 0
+            center(out, ctl->week_width, sep)
+        cal_disable_color(CAL_COLOR_HEADER)
+
+    fputc('\n', stdout)
+    cal_enable_color(CAL_COLOR_HEADER)
+    for i: struct cal_month* = month; i != nil; i = i->next:
+        if ctl->weektype != 0:
+            if ctl->julian:
+                printf("%*s%s", (i32)ctl->day_width - 1, "", day_headings)
+            else:
+                printf("%*s%s", (i32)ctl->day_width, "", day_headings)
+        else:
+            fputs(day_headings, stdout)
+        if i->next != nil:
+            printf("%*s", ctl->gutter_width, "")
+    cal_disable_color(CAL_COLOR_HEADER)
+    fputc('\n', stdout)
+
+static def cal_vert_output_header(month: struct cal_month*, ctl: const struct cal_control*):
+    out: char[300]
+    month_width: i32 = (i32)ctl->day_width * (MAXDAYS / DAYS_IN_WEEK)
+    cal_enable_color(CAL_COLOR_HEADER)
+    printf("%*s", (i32)ctl->day_width + 1, "")
+    cal_disable_color(CAL_COLOR_HEADER)
+
+    if ctl->header_hint or ctl->header_year:
+        cal_enable_color(CAL_COLOR_HEADER)
+        for m: struct cal_month* = month; m != nil; m = m->next:
+            snprintf(out, sizeof(out), "%s", ctl->full_month[m->month - 1])
+            left(out, (usize)month_width, ctl->gutter_width)
+        cal_disable_color(CAL_COLOR_HEADER)
+
+        if not ctl->header_year:
+            fputc('\n', stdout)
+            cal_enable_color(CAL_COLOR_HEADER)
+            printf("%*s", (i32)ctl->day_width + 1, "")
+            for m: struct cal_month* = month; m != nil; m = m->next:
+                snprintf(out, sizeof(out), "%04d", m->year)
+                left(out, (usize)month_width, ctl->gutter_width)
+            cal_disable_color(CAL_COLOR_HEADER)
+    else:
+        cal_enable_color(CAL_COLOR_HEADER)
+        for m: struct cal_month* = month; m != nil; m = m->next:
+            snprintf(out, sizeof(out), "%s %04d", ctl->full_month[m->month - 1], m->year)
+            left(out, (usize)month_width, ctl->gutter_width)
+        cal_disable_color(CAL_COLOR_HEADER)
+    fputc('\n', stdout)
+
+static def cal_output_months(month: struct cal_month*, ctl: const struct cal_control*):
+    firstwork: i32 = 0
+    if ctl->weekstart == SUNDAY:
+        firstwork = 1
+    elif ctl->weekstart == SATURDAY:
+        firstwork = 2
+
+    seq_wo_start: cstr = cal_get_color_sequence(CAL_COLOR_WORKDAY)
+    seq_wo_end: cstr = cal_get_color_disable_sequence(CAL_COLOR_WORKDAY)
+    seq_we_start: cstr = cal_get_color_sequence(CAL_COLOR_WEEKEND)
+    seq_we_end: cstr = cal_get_color_disable_sequence(CAL_COLOR_WEEKEND)
+    seq_ws_start: cstr = nil
+    seq_ws_end: cstr = nil
+
+    if ctl->weektype != 0:
+        seq_ws_start = cal_get_color_sequence(CAL_COLOR_WEEKS)
+        seq_ws_end = cal_get_color_disable_sequence(CAL_COLOR_WEEKS)
+
+    for week_line: i32 = 0; week_line < MAXDAYS / DAYS_IN_WEEK; week_line++:
+        for i: struct cal_month* = month; i != nil; i = i->next:
+            reqday: i32 = 0
+            if i->month == ctl->req.month and i->year == ctl->req.year:
+                if ctl->julian:
+                    reqday = ctl->req.day
+                else:
+                    reqday = ctl->req.day + 1 - day_in_year(ctl, 1, i->month, i->year)
+
+            skip: i32 = (i32)ctl->day_width - 1
+            if ctl->weektype != 0:
+                if 0 < i->weeks[week_line]:
+                    seq_start: cstr = seq_ws_start
+                    seq_end: cstr = seq_ws_end
+                    if ctl->req.week != 0 and ctl->req.week == i->weeks[week_line]:
+                        seq_start = cal_get_color_sequence(CAL_COLOR_WEEKNUMBER)
+                        seq_end = cal_get_color_disable_sequence(CAL_COLOR_WEEKNUMBER)
+                    if seq_start != nil and seq_start[0] != '\0':
+                        printf("%s%2d%s", seq_start, i->weeks[week_line], seq_end)
+                    else:
+                        printf("%2d", i->weeks[week_line])
+                else:
+                    printf("%2s", "")
+                skip = (i32)ctl->day_width
+
+            for d: i32 = DAYS_IN_WEEK * week_line; d < DAYS_IN_WEEK * week_line + DAYS_IN_WEEK; d++:
+                workday: bool = d >= DAYS_IN_WEEK * week_line + firstwork and d <= DAYS_IN_WEEK * week_line + firstwork + 4
+                if 0 < i->days[d]:
+                    if workday:
+                        fput_seq(seq_wo_start)
+                    else:
+                        fput_seq(seq_we_start)
+
+                    if reqday == i->days[d]:
+                        w: i32 = 2
+                        if ctl->julian:
+                            w = 3
+                        printf("%*s%s%*d%s", skip - w, "", cal_get_color_sequence(CAL_COLOR_TODAY), w, i->days[d], cal_get_color_disable_sequence(CAL_COLOR_TODAY))
+                    else:
+                        printf("%*d", skip, i->days[d])
+
+                    if workday:
+                        fput_seq(seq_wo_end)
+                    else:
+                        fput_seq(seq_we_end)
+                else:
+                    printf("%*s", skip, "")
+
+                if skip < (i32)ctl->day_width:
+                    skip++
+
+            if i->next != nil:
+                printf("%*s", ctl->gutter_width, "")
+        fputc('\n', stdout)
+
+static def cal_vert_output_months(month: struct cal_month*, ctl: const struct cal_control*):
+    firstwork: i32 = 0
+    if ctl->weekstart == SUNDAY:
+        firstwork = 1
+    elif ctl->weekstart == SATURDAY:
+        firstwork = 2
+
+    seq_wo_start: cstr = cal_get_color_sequence(CAL_COLOR_WORKDAY)
+    seq_wo_end: cstr = cal_get_color_disable_sequence(CAL_COLOR_WORKDAY)
+    seq_we_start: cstr = cal_get_color_sequence(CAL_COLOR_WEEKEND)
+    seq_we_end: cstr = cal_get_color_disable_sequence(CAL_COLOR_WEEKEND)
+    seq_hd_start: cstr = cal_get_color_sequence(CAL_COLOR_HEADER)
+    seq_hd_end: cstr = cal_get_color_disable_sequence(CAL_COLOR_HEADER)
+
+    skip: i32 = (i32)ctl->day_width
+    for i: i32 = 0; i < DAYS_IN_WEEK; i++:
+        seq_start: cstr = seq_wo_start
+        seq_end: cstr = seq_wo_end
+        fput_seq(seq_hd_start)
+        left(ctl->weekdays[i], ctl->day_width - 1, 0)
+        fput_seq(seq_hd_end)
+
+        if i < firstwork or i > firstwork + 4:
+            seq_start = seq_we_start
+            seq_end = seq_we_end
+
+        for m: struct cal_month* = month; m != nil; m = m->next:
+            reqday: i32 = 0
+            if m->month == ctl->req.month and m->year == ctl->req.year:
+                if ctl->julian:
+                    reqday = ctl->req.day
+                else:
+                    reqday = ctl->req.day + 1 - day_in_year(ctl, 1, m->month, m->year)
+
+            for week: i32 = 0; week < MAXDAYS / DAYS_IN_WEEK; week++:
+                d: i32 = i + DAYS_IN_WEEK * week
+                if 0 < m->days[d]:
+                    fput_seq(seq_start)
+                    if reqday == m->days[d]:
+                        w: i32 = 2
+                        if ctl->julian:
+                            w = 3
+                        printf("%*s%s%*d%s", skip - w, "", cal_get_color_sequence(CAL_COLOR_TODAY), w, m->days[d], cal_get_color_disable_sequence(CAL_COLOR_TODAY))
+                    else:
+                        printf("%*d", skip, m->days[d])
+                    fput_seq(seq_end)
+                else:
+                    printf("%*s", skip, "")
+                skip = (i32)ctl->day_width
+
+            if m->next != nil:
+                printf("%*s", ctl->gutter_width, "")
+        fputc('\n', stdout)
+
+    if ctl->weektype == 0:
+        return
+
+    seq_ws_start: cstr = cal_get_color_sequence(CAL_COLOR_WEEKS)
+    seq_ws_end: cstr = cal_get_color_disable_sequence(CAL_COLOR_WEEKS)
+    printf("%*s", (i32)ctl->day_width - 1, "")
+    for m: struct cal_month* = month; m != nil; m = m->next:
+        for week: i32 = 0; week < MAXDAYS / DAYS_IN_WEEK; week++:
+            if 0 < m->weeks[week]:
+                seq_start: cstr = seq_ws_start
+                seq_end: cstr = seq_ws_end
+                if ctl->req.week != 0 and ctl->req.week == m->weeks[week]:
+                    seq_start = cal_get_color_sequence(CAL_COLOR_WEEKNUMBER)
+                    seq_end = cal_get_color_disable_sequence(CAL_COLOR_WEEKNUMBER)
+                if seq_start != nil and seq_start[0] != '\0':
+                    w: i32 = 2
+                    if ctl->julian:
+                        w = 3
+                    printf("%*s%s%*d%s", skip - w, "", seq_start, w, m->weeks[week], seq_end)
+                else:
+                    printf("%*d", skip, m->weeks[week])
+            else:
+                printf("%*s", skip, "")
+        if m->next != nil:
+            printf("%*s", ctl->gutter_width, "")
+    fputc('\n', stdout)
+
+static def monthly(ctl: const struct cal_control*):
+    month: i32 = ctl->req.month
+    if ctl->req.start_month != 0:
+        month = ctl->req.start_month
+    year: i32 = ctl->req.year
+
+    if ctl->span_months != 0:
+        idx: i64 = (i64)year * MONTHS_IN_YEAR + month - 1 - ctl->num_months / 2
+        if idx < (i64)SMALLEST_YEAR * MONTHS_IN_YEAR:
+            idx = (i64)SMALLEST_YEAR * MONTHS_IN_YEAR
+        year = (i32)(idx / MONTHS_IN_YEAR)
+        month = (i32)(idx % MONTHS_IN_YEAR + 1)
+
+    ms: struct cal_month* = (struct cal_month*)calloc((usize)ctl->months_in_row, sizeof(struct cal_month))
+    if ms == nil:
+        exit(EXIT_FAILURE)
+
+    for i: i32 = 0; i < ctl->months_in_row - 1; i++:
+        ms[i].next = &ms[i + 1]
+
+    rows: i32 = (ctl->num_months - 1) / ctl->months_in_row
+    for i: i32 = 0; i < rows + 1; i++:
+        if i == rows and (ctl->num_months % ctl->months_in_row) > 0:
+            for n: i32 = (ctl->num_months % ctl->months_in_row) - 1; n < ctl->months_in_row; n++:
+                ms[n].next = nil
+
+        for m: struct cal_month* = ms; m != nil; m = m->next:
+            m->month = month++
+            m->year = year
+            if MONTHS_IN_YEAR < month:
+                year++
+                month = 1
+            cal_fill_month(m, ctl)
+
+        if ctl->vertical:
+            if i > 0:
+                fputc('\n', stdout)
+            cal_vert_output_header(ms, ctl)
+            cal_vert_output_months(ms, ctl)
+        else:
+            if i > 0:
+                fputc('\n', stdout)
+            cal_output_header(ms, ctl)
+            cal_output_months(ms, ctl)
+
+    free(ms)
+
+static def yearly(ctl: const struct cal_control*):
+    year_width: usize = (usize)ctl->months_in_row * ctl->week_width + ((usize)ctl->months_in_row - 1) * (usize)ctl->gutter_width
+    if ctl->header_year:
+        out: char[300]
+        snprintf(out, sizeof(out), "%04d", ctl->req.year)
+        center(out, year_width, 0)
+        fputs("\n\n", stdout)
+    monthly(ctl)
+
+static def parse_reform_year(reform_year: cstr) -> i32:
+    if strcasecmp(reform_year, "gregorian") == 0:
+        return GREGORIAN
+    if strcasecmp(reform_year, "iso") == 0:
+        return ISO
+    if strcasecmp(reform_year, "1752") == 0:
+        return GB1752
+    if strcasecmp(reform_year, "julian") == 0:
+        return JULIAN
+    fprintf(stderr, "cal: invalid --reform value: '%s'\n", reform_year)
+    exit(EXIT_FAILURE)
+
+static def usage():
+    printf("Usage:\n")
+    printf(" cal [options] [[[day] month] year]\n")
+    printf(" cal [options] <monthname>\n\n")
+    printf("Display a calendar, or some part of it.\n")
+    printf("Without any arguments, display the current month.\n\n")
+    printf("Options:\n")
+    printf(" -1, --one             show only a single month (default)\n")
+    printf(" -3, --three           show three months spanning the date\n")
+    printf(" -n, --months <num>    show num months starting with date's month\n")
+    printf(" -S, --span            span the date when displaying multiple months\n")
+    printf(" -t, --saturday        Saturday as first day of week\n")
+    printf(" -s, --sunday          Sunday as first day of week\n")
+    printf(" -m, --monday          Monday as first day of week\n")
+    printf(" -j, --julian          use day-of-year for all calendars\n")
+    printf("     --reform <val>    Gregorian reform date (1752|gregorian|iso|julian)\n")
+    printf("     --iso             alias for --reform=iso\n")
+    printf(" -y, --year            show the whole year\n")
+    printf(" -Y, --twelve          show the next twelve months\n")
+    printf(" -w, --week[=<num>]    show US or ISO-8601 week numbers\n")
+    printf(" -v, --vertical        show day vertically instead of line\n")
+    printf(" -c, --columns <width> amount of columns to use\n")
+    printf("     --color           highlight today / requested week\n")
+    printf(" -h, --help            display this help\n")
+    exit(EXIT_SUCCESS)
+
+def main(argc: i32, argv: str*) -> i32:
+    local_time: struct tm
+    now: time_t
+    yflag: i32 = 0
+    Yflag: i32 = 0
+    cols: i32 = COLUMNS_MAX_THREE
+
+    static ctl: struct cal_control
+    ctl.reform_year = DEFAULT_REFORM_YEAR
+    ctl.weekstart = SUNDAY
+    ctl.span_months = 0
+    ctl.weektype = WEEK_NUM_DISABLED
+    ctl.day_width = DAY_LEN
+    ctl.gutter_width = 2
+    ctl.req.day = 0
+    ctl.req.month = 0
+
+    use_color = isatty(STDOUT_FILENO) != 0
+
+    ch: i32 = 0
+    while (ch = getopt(argc, argv, "13mjn:stSyw::Yvc:h")) != -1:
+        switch ch:
+            case '1':
+                ctl.num_months = 1
+                break
+            case '3':
+                ctl.num_months = 3
+                ctl.span_months = 1
+                break
+            case 't':
+                ctl.weekstart = SATURDAY
+                break
+            case 's':
+                ctl.weekstart = SUNDAY
+                break
+            case 'm':
+                ctl.weekstart = MONDAY
+                break
+            case 'j':
+                ctl.julian = true
+                ctl.day_width = DAY_LEN + 1
+                break
+            case 'y':
+                yflag = 1
+                break
+            case 'Y':
+                Yflag = 1
+                break
+            case 'n':
+                ctl.num_months = atoi(optarg)
+                break
+            case 'S':
+                ctl.span_months = 1
+                break
+            case 'w':
+                if optarg != nil:
+                    if *optarg == '=':
+                        optarg++
+                    ctl.req.week = atoi(optarg)
+                    if ctl.req.week < 1 or 54 < ctl.req.week:
+                        fprintf(stderr, "cal: illegal week value: use 1-54\n")
+                        return EXIT_FAILURE
+                ctl.weektype = WEEK_NUM_US
+                break
+            case 'v':
+                ctl.vertical = true
+                break
+            case 'c':
+                if strcmp(optarg, "auto") == 0:
+                    cols = COLUMNS_AUTO
+                else:
+                    cols = atoi(optarg)
+                break
+            case 'h':
+                usage()
+                break
+            default:
+                return EXIT_FAILURE
+
+    argc -= optind
+    argv += optind
+
+    if ctl.weektype != 0:
+        ctl.weektype = ctl.req.week & WEEK_NUM_MASK
+        if ctl.weekstart == MONDAY:
+            ctl.weektype |= WEEK_NUM_ISO
+        else:
+            ctl.weektype |= WEEK_NUM_US
+        ctl.week_width = (ctl.day_width * DAYS_IN_WEEK) + WNUM_LEN
+    else:
+        ctl.week_width = ctl.day_width * DAYS_IN_WEEK
+    ctl.week_width -= 1
+
+    time(&now)
+    localtime_r(&now, &local_time)
+
+    if argc == 1 and not isdigit((u8)argv[0][0]):
+        mnum: i32 = monthname_to_number(&ctl, argv[0])
+        if mnum > 0:
+            ctl.req.month = mnum
+            argc = 0
+        else:
+            fprintf(stderr, "cal: unknown month name: %s\n", argv[0])
+            return EXIT_FAILURE
+
+    switch argc:
+        case 3:
+            ctl.req.day = atoi(*argv++)
+            if ctl.req.day < 1 or DAYS_IN_MONTH < ctl.req.day:
+                fprintf(stderr, "cal: illegal day value: use 1-%d\n", DAYS_IN_MONTH)
+                return EXIT_FAILURE
+        case 2:
+            if isdigit((u8)**argv):
+                ctl.req.month = atoi(*argv++)
+            else:
+                ctl.req.month = monthname_to_number(&ctl, *argv)
+                if ctl.req.month < 0:
+                    fprintf(stderr, "cal: unknown month name: %s\n", *argv)
+                    return EXIT_FAILURE
+                argv++
+            if ctl.req.month < 1 or MONTHS_IN_YEAR < ctl.req.month:
+                fprintf(stderr, "cal: illegal month value: use 1-12\n")
+                return EXIT_FAILURE
+        case 1:
+            ctl.req.year = atoi(*argv++)
+            if ctl.req.year < SMALLEST_YEAR or ctl.req.year == JULIAN:
+                fprintf(stderr, "cal: illegal year value\n")
+                return EXIT_FAILURE
+            if ctl.req.day != 0:
+                dm: i32 = days_in_month_lookup(leap_year(&ctl, ctl.req.year), ctl.req.month)
+                if ctl.req.day > dm:
+                    fprintf(stderr, "cal: illegal day value: use 1-%d\n", dm)
+                    return EXIT_FAILURE
+                ctl.req.day = day_in_year(&ctl, ctl.req.day, ctl.req.month, ctl.req.year)
+            elif (i32)(local_time.tm_year + 1900) == ctl.req.year:
+                ctl.req.day = local_time.tm_yday + 1
+            if ctl.req.month == 0 and ctl.req.week == 0:
+                ctl.req.month = local_time.tm_mon + 1
+                if ctl.num_months == 0:
+                    yflag = 1
+            break
+        case 0:
+            if ctl.req.week == 0:
+                ctl.req.day = local_time.tm_yday + 1
+                if ctl.req.month == 0:
+                    ctl.req.month = local_time.tm_mon + 1
+            ctl.req.year = local_time.tm_year + 1900
+            break
+        default:
+            usage()
+
+    if 0 < ctl.req.week:
+        yday: i32 = week_to_day(&ctl)
+        leap: i32 = leap_year(&ctl, ctl.req.year)
+        m: i32 = 1
+        if yday < 1:
+            fprintf(stderr, "cal: illegal week value: year %d doesn't have week %d\n", ctl.req.year, ctl.req.week)
+            return EXIT_FAILURE
+        while m <= DECEMBER and yday > days_in_month_lookup(leap, m):
+            yday -= days_in_month_lookup(leap, m++)
+        if DECEMBER < m and (ctl.weektype & WEEK_NUM_ISO) != 0:
+            if ctl.req.week != week_number(31, DECEMBER, ctl.req.year - 1, &ctl):
+                fprintf(stderr, "cal: illegal week value: year %d doesn't have week %d\n", ctl.req.year, ctl.req.week)
+                return EXIT_FAILURE
+        if ctl.req.month == 0:
+            if MONTHS_IN_YEAR < m:
+                ctl.req.month = 1
+            else:
+                ctl.req.month = m
+
+    weekdays_init(&ctl)
+    headers_init(&ctl)
+
+    if yflag != 0 or Yflag != 0:
+        ctl.gutter_width = 3
+        if ctl.num_months == 0:
+            ctl.num_months = MONTHS_IN_YEAR
+        if yflag != 0:
+            ctl.req.start_month = 1
+            ctl.header_year = true
+
+    if ctl.vertical:
+        ctl.gutter_width = 1
+
+    if ctl.num_months > 1 and ctl.months_in_row == 0:
+        ctl.months_in_row = MONTHS_IN_YEAR_ROW
+        if cols > 0:
+            ctl.months_in_row = cols
+    elif ctl.months_in_row == 0:
+        ctl.months_in_row = 1
+
+    if ctl.num_months == 0:
+        ctl.num_months = 1
+
+    if yflag != 0 or Yflag != 0:
+        yearly(&ctl)
+    else:
+        monthly(&ctl)
+
+    return EXIT_SUCCESS
