@@ -3,12 +3,12 @@ import stdio.h
 import stdint.h
 import stdbool.h
 
-define MAX_GREETINGS 3
+MAX_GREETINGS = 3
 
 def greet(name: cstr, count: i32) -> i32:
     if name == nil or count <= 0:
         return 0
-    for i in 0..count:
+    for i in range(count):
         printf("[%d] Hello from Strata, %s!\n", i + 1, name)
     return count
 

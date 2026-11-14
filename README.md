@@ -18,8 +18,9 @@ Just as **LMON is JSON and JSON is LMON**, **Strata is C/C++ and C/C++ is Strata
    - Indentation-delimited blocks (`:`) instead of `{` and `}` (including automatic `};` termination on `struct`, `class`, `union`, and `enum` definitions).
    - No statement-ending semicolons (`;`).
    - Python-style `def name(arg: type) -> ret_type:` functions and `name: type = value` declarations.
+   - Pythonic pointer & type ergonomics: `addr[T]` instead of `T*`, `var.addr` instead of `&var`, `val(ptr)` instead of `*ptr`, `cast(addr[T], p)` and `u8(x)` / `i32(x)` function-call type casts instead of `(u8)x`, unified `.` member access (`ptr.field` automatically emits `ptr->field`), and automatic `struct`/`enum`/`union` tag resolution without repeating `struct` or `enum`.
    - Pythonic keywords and logical operators (`elif`, `and`, `or`, `not`, `nil` / `None`, `self`, `pass`, `in`).
-   - `#` single-line comments and `import` / `from ... import` / `define` preprocessor directives.
+   - `#` single-line comments, `import` / `from ... import` module imports, and Python-style top-level `NAME = value` / `NAME(a, b) = expr` preprocessor definitions.
 3. **Auto-Detected Indentation & Universal Newlines:** Supports any consistent indentation unit per file (`W` spaces or `W` tabs, locked on the first indented line) and universal line endings (`\n`, `\r\n`, `\r`).
 4. **Blazing-Fast Single-File C Transpiler:** [`strata.c`](strata.c) is a self-contained, zero-dependency C11 implementation that transpiles at **3,100+ files/s (`225+ MiB/s`)**.
 
@@ -35,7 +36,7 @@ import stdio.h
 import stdint.h
 import stdbool.h
 
-define MAX_GREETINGS 3
+MAX_GREETINGS = 3
 
 enum Status:
     OK = 0
@@ -56,7 +57,7 @@ def clamp(val: i32, lo: i32, hi: i32) -> i32:
 def greet(name: cstr, count: i32) -> i32:
     if name == nil or count <= 0:
         return 0
-    for i in 0..count:
+    for i in range(count):
         printf("[%d] Hello from Strata, %s!\n", i + 1, name)
     return count
 
@@ -151,7 +152,9 @@ In particular, `import` distinguishes between **Strata modules (`.st`)** and **u
 | `import stdio.h` | `#include <stdio.h>` | Explicit `.h` / `.c` extension imports an untranspiled C/C++ file directly. |
 | `import sys/stat.h` | `#include <sys/stat.h>` | Explicit path with `.h` extension imports system header directly. |
 | `import "vendor.c"` | `#include "vendor.c"` | Quoted `.h` or `.c` path imports a local untranspiled C file directly. |
-| `define MAX_LEN 1024` | `#define MAX_LEN 1024` | Object-like or function-like macro definition. |
+| `MAX_LEN = 1024` | `#define MAX_LEN 1024` | Top-level untyped assignment defines a preprocessor constant macro. |
+| `MIN(a, b) = ((a) < (b) ? (a) : (b))` | `#define MIN(a, b) ((a) < (b) ? (a) : (b))` | Top-level untyped `NAME(args) = expr` defines a function-like macro. |
+| `define _GNU_SOURCE` | `#define _GNU_SOURCE` | Valueless preprocessor feature flag. |
 | `ifdef DEBUG` / `ifndef NDEBUG` | `#ifdef DEBUG` / `#ifndef NDEBUG` | Conditional compilation guards. |
 | `endif` | `#endif` | End conditional compilation guard. |
 | `pragma once` | `#pragma once` | Compiler/header pragma directive. |
@@ -204,13 +207,71 @@ Variables, struct/class fields, and constants use Pythonic postfix type annotati
 | `name: cstr = "Strata"` | `const char* name = "Strata";` |
 | `buf: char[64]` | `char buf[64];` |
 | `matrix: f32[4][4]` | `float matrix[4][4];` |
-| `node_ptr: Node* = nil` | `Node* node_ptr = NULL;` |
+| `node_ptr: addr[Node] = nil` | `struct Node* node_ptr = NULL;` |
 
 Notice how array dimensions attached to the type (`buf: char[64]`) automatically transpose to valid C declarator syntax (`char buf[64];`).
 
 ---
 
-### 6. Functions & Methods (`def`)
+### 6. Pythonic Pointers, Types, and Unified `.` Member Access
+
+Strata replaces C's cryptic `*`, `&`, `->`, `(type)expr`, and repetitive `struct`/`enum` keywords with clean, readable Pythonic forms that map 1-to-1 to C:
+
+| Strata Syntax | C / C++ Equivalent | Description |
+| :--- | :--- | :--- |
+| `p: addr[i32]` | `int32_t* p;` | Pointer type (`addr[T]` instead of `T*`). |
+| `s: addr[const Shape]` | `const struct Shape* s;` | Const pointer to a struct (`struct` tag resolved automatically). |
+| `argv: addr[str]` | `char** argv;` | Nested pointer (`str` is `char*`, so `addr[str]` is `char**`). |
+| `var.addr` | `&var` | Address-of property (`c.addr`, `ms[i + 1].addr`). |
+| `val(ptr)` | `*ptr` | Dereference expression (`val(p) = 10`, `val(cur++) = ' '`). |
+| `u8(x)`, `i32(a + b)` | `(uint8_t)x`, `(int32_t)(a + b)` | Scalar value conversion as a function call (like `int(x)` / `float(x)` in Python). |
+| `cast(addr[Shape], ptr)` | `(struct Shape*)ptr` | Python `typing.cast(Type, val)` — used for pointer reinterpretation (`cast(addr[T], p)`) and also works for value conversions (`cast(i32, x)`). |
+| `s.width` | `s->width` _(if `s` is `addr[T]`)_ or `s.width` | Unified `.` member access — automatically emits `->` for pointers and `self`. |
+| `c: Shape` | `struct Shape c;` | Declared `struct`, `enum`, and `union` names do not repeat `struct`/`enum`. |
+| `sizeof(Shape)` | `sizeof(struct Shape)` | Automatic `struct`/`enum`/`union` prefix inside `sizeof(...)`. |
+
+```python
+struct Vec2:
+    x: f64
+    y: f64
+
+def translate(v: addr[Vec2], dx: f64, dy: f64):
+    v.x += dx
+    v.y += dy
+
+def main() -> i32:
+    origin: Vec2
+    origin.x = 1.0
+    origin.y = 2.0
+    translate(origin.addr, 3.0, 4.0)
+    return 0
+```
+
+Transpiles to:
+
+```c
+struct Vec2 {
+    double x;
+    double y;
+};
+
+void translate(struct Vec2* v, double dx, double dy) {
+    v->x += dx;
+    v->y += dy;
+}
+
+int32_t main(void) {
+    struct Vec2 origin;
+    origin.x = 1.0;
+    origin.y = 2.0;
+    translate(&origin, 3.0, 4.0);
+    return 0;
+}
+```
+
+---
+
+### 7. Functions & Methods (`def`)
 
 Functions and methods are declared with `def` (or `fn`), typed parameters `(name: type, ...)`, and an optional return type `-> ret_type`:
 
@@ -244,7 +305,7 @@ Functions and methods are declared with `def` (or `fn`), typed parameters `(name
 
 ---
 
-### 7. Control Flow & Range Loops
+### 8. Control Flow & Range Loops
 
 Parentheses around `if`, `elif`, `while`, `for`, and `switch` conditions are omitted in Strata and automatically synthesized in C/C++:
 
@@ -257,17 +318,20 @@ Parentheses around `if`, `elif`, `while`, `for`, and `switch` conditions are omi
    else:
        step_c()
    ```
-2. **Range-Based & C-Style `for` Loops:**
-   - **Exclusive integer range (`a..b`):**
-     `for i in 0..n:` → `for (int i = 0; i < n; i++) {`
-   - **Inclusive integer range (`a..=b`):**
-     `for i in 1..=10:` → `for (int i = 1; i <= 10; i++) {`
-   - **Typed or stepped range (`for i: usize in 0..len step 2:`):**
-     → `for (size_t i = 0; i < len; i += 2) {`
+2. **Pythonic `range()` & C-Style `for` Loops:**
+   - **`range(stop)` (0 to `stop - 1`):**
+     `for i in range(n):` ↔ `for (int32_t i = 0; i < n; i++) {`
+   - **`range(start, stop)` (`start` to `stop - 1`):**
+     `for i in range(1, month):` ↔ `for (int32_t i = 1; i < month; i++) {`
+   - **`range(start, stop, step)` (custom or negative step):**
+     `for i in range(0, len, 2):` ↔ `for (int32_t i = 0; i < len; i += 2) {`
+     `for i in range(10, 0, -1):` ↔ `for (int32_t i = 10; i > 0; i--) {`
+   - **Typed loop variable (`for i: usize in range(len):`):**
+     ↔ `for (size_t i = 0; i < len; i++) {`
    - **C++ iterable range (`for item in vec:`):**
      → `for (auto item : vec) {`
-   - **Classic 3-clause C loop (`for i: i32 = 0; i < n; i++:`):**
-     → `for (int32_t i = 0; i < n; i++) {`
+   - **Classic 3-clause C loop (`for m: addr[cal_month] = month; m != nil; m = m.next:`):**
+     ↔ `for (struct cal_month* m = month; m != NULL; m = m->next) {`
 3. **`while` and `do` / `while` Loops:**
    ```python
    while count > 0:
@@ -290,7 +354,7 @@ Parentheses around `if`, `elif`, `while`, `for`, and `switch` conditions are omi
 
 ---
 
-### 8. Structs, Classes, Enums, and Unions
+### 9. Structs, Classes, Enums, and Unions
 
 Block types that require a trailing semicolon in C/C++ (`struct`, `class`, `union`, `enum`) automatically close with `};` when their indentation block ends, and `enum` members automatically receive trailing commas:
 
@@ -309,8 +373,8 @@ class Counter(BaseCounter):
     public:
         count: i64
         def increment(delta: i64) -> i64:
-            self->count += delta
-            return self->count
+            self.count += delta
+            return self.count
 ```
 
 Transpiles to:
@@ -340,7 +404,7 @@ public:
 
 ---
 
-### 9. Formal Grammar (EBNF)
+### 10. Formal Grammar (EBNF)
 
 ```ebnf
 module         = { blank_line | comment_line | directive_line | statement(0) } ;
@@ -367,13 +431,15 @@ param          = ident ":" type_spec [ "=" expr ] | "..." ;
 
 var_decl       = [ "const" | "static" | "extern" ] ident ":" type_spec [ "=" expr ] ;
 type_alias     = "type" ident "=" type_spec ;
-range_clause   = ident [ ":" type_spec ] "in" expr [ ( ".." | "..=" ) expr [ "step" expr ] ] ;
+range_clause   = ident [ ":" type_spec ] "in" ( "range" "(" expr [ "," expr [ "," expr ] ] ")" | expr ) ;
 
 directive_line = ( "import" ( strata_module | c_header_file )
                  | "from" ( strata_module | c_header_file ) "import" ( "*" | ident_list )
+                 | macro_assign
                  | "define" ident [ expr ]
                  | ( "ifdef" | "ifndef" | "pragma" ) rest_of_line
                  | "endif" ) EOL ;
+macro_assign   = ident [ "(" [ ident_list ] ")" ] "=" expr ; (* Top-level untyped `=` -> #define *)
 strata_module  = ident ;                       (* Extensionless: resolves to .st module -> "ident.h" *)
 c_header_file  = path_stem "." ( "h" | "c" | "hpp" ) ; (* Explicit extension: resolves to <path.h> *)
 ```
