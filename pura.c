@@ -507,7 +507,7 @@ static void translate_tokens_pura_to_c(PuraBuf *out, const char *s, size_t len) 
                 }
             }
 
-            /* `val(p)` -> `*p` and `val(p, level)` -> `**...*p` */
+            /* `val(p)` -> `*p` and `val(level, p)` -> `**...*p` */
             if (!is_member && wlen == 3 && memcmp(s + start, "val", 3) == 0 &&
                 i < len && s[i] == '(') {
                 size_t close_p = find_matching_paren(s, len, i);
@@ -537,14 +537,15 @@ static void translate_tokens_pura_to_c(PuraBuf *out, const char *s, size_t len) 
                     size_t expr_len = inner_len;
                     size_t deref_level = 1;
                     if (comma < inner_len) {
-                        expr_len = comma;
-                        while (expr_len > 0 && expr_s[0] == ' ') { expr_s++; expr_len--; }
-                        while (expr_len > 0 && expr_s[expr_len - 1] == ' ') expr_len--;
-
-                        const char *lvl_s = inner + comma + 1;
-                        size_t lvl_len = inner_len - (comma + 1);
+                        const char *lvl_s = inner;
+                        size_t lvl_len = comma;
                         while (lvl_len > 0 && lvl_s[0] == ' ') { lvl_s++; lvl_len--; }
                         while (lvl_len > 0 && lvl_s[lvl_len - 1] == ' ') lvl_len--;
+
+                        expr_s = inner + comma + 1;
+                        expr_len = inner_len - (comma + 1);
+                        while (expr_len > 0 && expr_s[0] == ' ') { expr_s++; expr_len--; }
+                        while (expr_len > 0 && expr_s[expr_len - 1] == ' ') expr_len--;
 
                         if (lvl_len > 0) {
                             size_t parsed = 0;
@@ -888,7 +889,7 @@ static void translate_tokens_c_to_pura(PuraBuf *out, const char *s, size_t len) 
                 continue;
             }
         }
-        /* Unary dereference `*expr` -> `val(expr)` and `**expr` -> `val(expr, 2)` */
+        /* Unary dereference `*expr` -> `val(expr)` and `**expr` -> `val(2, expr)` */
         if (c == '*' && is_c_unary_prefix_pos(s, i)) {
             size_t stars = 0;
             while (i + stars < len && s[i + stars] == '*') stars++;
@@ -901,15 +902,15 @@ static void translate_tokens_c_to_pura(PuraBuf *out, const char *s, size_t len) 
                         op_s++;
                         op_len -= 2;
                     }
-                    pura_buf_puts(out, "val(");
-                    translate_tokens_c_to_pura(out, op_s, op_len);
                     if (stars > 1) {
                         char lvl_buf[24];
-                        snprintf(lvl_buf, sizeof(lvl_buf), ", %zu)", stars);
+                        snprintf(lvl_buf, sizeof(lvl_buf), "val(%zu, ", stars);
                         pura_buf_puts(out, lvl_buf);
                     } else {
-                        pura_buf_putc(out, ')');
+                        pura_buf_puts(out, "val(");
                     }
+                    translate_tokens_c_to_pura(out, op_s, op_len);
+                    pura_buf_putc(out, ')');
                     i = op_end;
                     continue;
                 }
@@ -3047,13 +3048,13 @@ static int run_tests(void) {
         "    printf(\"total=%d\\n\", total)\n"
         "    return 0\n",
 
-        /* Tab-indented with switch/case, pointers, multi-level deref val(ptr, level), and enum */
+        /* Tab-indented with switch/case, pointers, multi-level deref val(level, ptr), and enum */
         "import stdint.h\n"
         "enum Status:\n"
         "\tOK = 0\n"
         "\tERR = 1\n"
         "def check(argv: addr[cstr], out_code: addr[i32], code: i32) -> bool:\n"
-        "\tif argv == nil or val(argv, 2) == '\\0' or code != 0:\n"
+        "\tif argv == nil or val(2, argv) == '\\0' or code != 0:\n"
         "\t\tval(out_code) = ERR\n"
         "\t\treturn false\n"
         "\tswitch code:\n"

@@ -874,7 +874,7 @@ def main(argc: i32, argv: addr[str]) -> i32:
                 fprintf(stderr, "cal: illegal day value: use 1-%d\n", DAYS_IN_MONTH)
                 return EXIT_FAILURE
         case 2:
-            if isdigit(u8(val(argv, 2))):
+            if isdigit(u8(val(2, argv))):
                 ctl.req.month = atoi(val(argv++))
             else:
                 ctl.req.month = monthname_to_number(ctl.addr, val(argv))
