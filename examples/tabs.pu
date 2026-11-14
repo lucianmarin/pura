@@ -1,4 +1,4 @@
-# Tab-indented Strata demonstrating auto-detected \t indentation
+# Tab-indented Pura demonstrating auto-detected \t indentation
 import stdio.h
 import stdint.h
 

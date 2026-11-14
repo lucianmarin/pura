@@ -1,10 +1,10 @@
-# Strata — Pythonic C/C++ Bidirectional Transpiler
+# Pura — Pythonic C/C++ Bidirectional Transpiler
 
-**Strata** is a human-readable, zero-overhead **1-to-1 syntactic representation of C and C++** inspired by Python's clean naming, type annotations, and block indentation.
+**Pura** is a human-readable, zero-overhead **1-to-1 syntactic representation of C and C++** inspired by Python's clean naming, type annotations, and block indentation.
 
-Just as **LMON is JSON and JSON is LMON**, **Strata is C/C++ and C/C++ is Strata**. Every Strata construct maps directly and deterministically to an exact C/C++ equivalent—with **no curly braces (`{` `}`) for blocks**, **no trailing semicolons (`;`)**, **Pythonic function and variable type annotations (`def`, `name: type -> ret`)**, **concise fixed-width type aliases (`i8`..`i64`, `u8`..`u64`, `f32`, `f64`, `usize`, `cstr`, `str`)**, and **zero runtime or ABI overhead**.
+Just as **LMON is JSON and JSON is LMON**, **Pura is C/C++ and C/C++ is Pura**. Every Pura construct maps directly and deterministically to an exact C/C++ equivalent—with **no curly braces (`{` `}`) for blocks**, **no trailing semicolons (`;`)**, **Pythonic function and variable type annotations (`def`, `name: type -> ret`)**, **concise fixed-width type aliases (`i8`..`i64`, `u8`..`u64`, `f32`, `f64`, `usize`, `cstr`, `str`)**, and **zero runtime or ABI overhead**.
 
-- **Extension:** `.st` (or `.strata`)
+- **Extension:** `.pu` (or `.pura`)
 - **Target Languages:** ISO C11 / C17 / C23 and ISO C++17 / C++20
 - **Encoding:** UTF-8 (without BOM)
 - **Version:** 1.0
@@ -13,7 +13,7 @@ Just as **LMON is JSON and JSON is LMON**, **Strata is C/C++ and C/C++ is Strata
 
 ## Design Goals
 
-1. **Bijective C/C++ Structural Equivalence:** Every Strata file transpiles 1-to-1 into clean, human-readable C/C++ and converts back via `--from-c` with zero hidden runtime, garbage collector, or non-standard ABI wrapper.
+1. **Bijective C/C++ Structural Equivalence:** Every Pura file transpiles 1-to-1 into clean, human-readable C/C++ and converts back via `--from-c` with zero hidden runtime, garbage collector, or non-standard ABI wrapper.
 2. **Pythonic Readability:**
    - Indentation-delimited blocks (`:`) instead of `{` and `}` (including automatic `};` termination on `struct`, `class`, `union`, and `enum` definitions).
    - No statement-ending semicolons (`;`).
@@ -22,16 +22,16 @@ Just as **LMON is JSON and JSON is LMON**, **Strata is C/C++ and C/C++ is Strata
    - Pythonic keywords and logical operators (`elif`, `and`, `or`, `not`, `nil` / `None`, `self`, `pass`, `in`).
    - `#` single-line comments, `import` / `from ... import` module imports, and Python-style top-level `NAME = value` / `NAME(a, b) = expr` preprocessor definitions.
 3. **Auto-Detected Indentation & Universal Newlines:** Supports any consistent indentation unit per file (`W` spaces or `W` tabs, locked on the first indented line) and universal line endings (`\n`, `\r\n`, `\r`).
-4. **Blazing-Fast Single-File C Transpiler:** [`strata.c`](strata.c) is a self-contained, zero-dependency C11 implementation that transpiles at **3,100+ files/s (`225+ MiB/s`)**.
+4. **Blazing-Fast Single-File C Transpiler:** [`pura.c`](pura.c) is a self-contained, zero-dependency C11 implementation that transpiles at **3,100+ files/s (`225+ MiB/s`)**.
 
 ---
 
 ## Side-by-Side Comparison
 
-### Strata (`.st`)
+### Pura (`.pu`)
 
 ```python
-# Service node evaluator in Strata
+# Service node evaluator in Pura
 import stdio.h
 import stdint.h
 import stdbool.h
@@ -58,7 +58,7 @@ def greet(name: cstr, count: i32) -> i32:
     if name == nil or count <= 0:
         return 0
     for i in range(count):
-        printf("[%d] Hello from Strata, %s!\n", i + 1, name)
+        printf("[%d] Hello from Pura, %s!\n", i + 1, name)
     return count
 
 def main() -> i32:
@@ -71,7 +71,7 @@ def main() -> i32:
 ### Equivalent C (`.c`)
 
 ```c
-// Service node evaluator in Strata
+// Service node evaluator in Pura
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -102,8 +102,8 @@ int32_t greet(const char* name, int32_t count) {
     if (name == NULL || count <= 0) {
         return 0;
     }
-    for (int i = 0; i < count; i++) {
-        printf("[%d] Hello from Strata, %s!\n", i + 1, name);
+    for (int32_t i = 0; i < count; i++) {
+        printf("[%d] Hello from Pura, %s!\n", i + 1, name);
     }
     return count;
 }
@@ -119,12 +119,12 @@ int32_t main(void) {
 
 ---
 
-## Strata 1.0 Specification
+## Pura 1.0 Specification
 
 ### 1. Encoding, Universal Newlines, and Auto-Detected Indentation
 
 1. **UTF-8:** Source files MUST be valid UTF-8 without a byte-order mark (`U+FEFF` at byte 0 is a syntax error).
-2. **Universal Newlines (`LF`, `CRLF`, `CR`):** Strata supports `\n`, `\r\n`, and `\r` line endings interchangeably outside string literals.
+2. **Universal Newlines (`LF`, `CRLF`, `CR`):** Pura supports `\n`, `\r\n`, and `\r` line endings interchangeably outside string literals.
 3. **Blank Lines:** Lines containing zero characters or only ASCII spaces (`0x20`) and/or tabs (`0x09`) before a line ending are preserved as blank lines without affecting indentation tracking.
 4. **Auto-Detected Indentation (Spaces or Tabs):**
    - Root declarations sit at indentation level `0`.
@@ -137,18 +137,18 @@ int32_t main(void) {
 
 ### 2. Comments & Preprocessor Directives
 
-Because Strata uses `#` for Python-style comments, C preprocessor directives are expressed as clean, bracket-free keywords at the start of a line.
+Because Pura uses `#` for Python-style comments, C preprocessor directives are expressed as clean, bracket-free keywords at the start of a line.
 
-In particular, `import` distinguishes between **Strata modules (`.st`)** and **untranspiled C/C++ files (`.h` / `.c` / `.hpp`)** by whether a file extension is present:
+In particular, `import` distinguishes between **Pura modules (`.pu`)** and **untranspiled C/C++ files (`.h` / `.c` / `.hpp`)** by whether a file extension is present:
 
-- **Without an extension (`import math_utils`):** Refers to a Strata `.st` module (`math_utils.st`), transpiling to `#include "math_utils.h"`.
+- **Without an extension (`import math_utils`):** Refers to a Pura `.pu` module (`math_utils.pu`), transpiling to `#include "math_utils.h"`.
 - **With an explicit `.h` or `.c` extension (`import stdio.h`):** Imports an untranspiled C/C++ header or source file directly (`#include <stdio.h>`).
 
-| Strata Syntax | C / C++ Equivalent | Notes |
+| Pura Syntax | C / C++ Equivalent | Notes |
 | :--- | :--- | :--- |
 | `# comment text` | `// comment text` | Full-line or inline comment (preceded by space outside quotes). |
-| `import math_utils` | `#include "math_utils.h"` | Extensionless `import` is exclusively for Strata `.st` modules. |
-| `from math_utils import *` | `#include "math_utils.h"` | Python-style `from` import of a Strata `.st` module. |
+| `import math_utils` | `#include "math_utils.h"` | Extensionless `import` is exclusively for Pura `.pu` modules. |
+| `from math_utils import *` | `#include "math_utils.h"` | Python-style `from` import of a Pura `.pu` module. |
 | `import stdio.h` | `#include <stdio.h>` | Explicit `.h` / `.c` extension imports an untranspiled C/C++ file directly. |
 | `import sys/stat.h` | `#include <sys/stat.h>` | Explicit path with `.h` extension imports system header directly. |
 | `import "vendor.c"` | `#include "vendor.c"` | Quoted `.h` or `.c` path imports a local untranspiled C file directly. |
@@ -163,9 +163,9 @@ In particular, `import` distinguishes between **Strata modules (`.st`)** and **u
 
 ### 3. Concise Fixed-Width & Primitive Type Aliases
 
-Strata provides concise, unambiguous primitive type names alongside all standard C/C++ types:
+Pura provides concise, unambiguous primitive type names alongside all standard C/C++ types:
 
-| Strata Type | C / C++ Type | Description |
+| Pura Type | C / C++ Type | Description |
 | :--- | :--- | :--- |
 | `i8`, `i16`, `i32`, `i64` | `int8_t`, `int16_t`, `int32_t`, `int64_t` | Signed fixed-width integers (`<stdint.h>`). |
 | `u8`, `u16`, `u32`, `u64` | `uint8_t`, `uint16_t`, `uint32_t`, `uint64_t` | Unsigned fixed-width integers (`<stdint.h>`). |
@@ -181,7 +181,7 @@ Strata provides concise, unambiguous primitive type names alongside all standard
 
 ### 4. Keywords, Logical Operators, and Literals
 
-| Strata Token | C / C++ Equivalent | Description |
+| Pura Token | C / C++ Equivalent | Description |
 | :--- | :--- | :--- |
 | `and` | `&&` | Logical AND operator. |
 | `or` | `\|\|` | Logical OR operator. |
@@ -199,12 +199,12 @@ Strata provides concise, unambiguous primitive type names alongside all standard
 
 Variables, struct/class fields, and constants use Pythonic postfix type annotations:
 
-| Strata Syntax | C / C++ Equivalent |
+| Pura Syntax | C / C++ Equivalent |
 | :--- | :--- |
 | `count: i32 = 42` | `int32_t count = 42;` |
 | `const pi: f64 = 3.14159` | `const double pi = 3.14159;` |
 | `static retries: u8 = 3` | `static uint8_t retries = 3;` |
-| `name: cstr = "Strata"` | `const char* name = "Strata";` |
+| `name: cstr = "Pura"` | `const char* name = "Pura";` |
 | `buf: char[64]` | `char buf[64];` |
 | `matrix: f32[4][4]` | `float matrix[4][4];` |
 | `node_ptr: addr[Node] = nil` | `struct Node* node_ptr = NULL;` |
@@ -215,9 +215,9 @@ Notice how array dimensions attached to the type (`buf: char[64]`) automatically
 
 ### 6. Pythonic Pointers, Types, and Unified `.` Member Access
 
-Strata replaces C's cryptic `*`, `&`, `->`, `(type)expr`, and repetitive `struct`/`enum` keywords with clean, readable Pythonic forms that map 1-to-1 to C:
+Pura replaces C's cryptic `*`, `&`, `->`, `(type)expr`, and repetitive `struct`/`enum` keywords with clean, readable Pythonic forms that map 1-to-1 to C:
 
-| Strata Syntax | C / C++ Equivalent | Description |
+| Pura Syntax | C / C++ Equivalent | Description |
 | :--- | :--- | :--- |
 | `p: addr[i32]` | `int32_t* p;` | Pointer type (`addr[T]` instead of `T*`). |
 | `s: addr[const Shape]` | `const struct Shape* s;` | Const pointer to a struct (`struct` tag resolved automatically). |
@@ -307,7 +307,7 @@ Functions and methods are declared with `def` (or `fn`), typed parameters `(name
 
 ### 8. Control Flow & Range Loops
 
-Parentheses around `if`, `elif`, `while`, `for`, and `switch` conditions are omitted in Strata and automatically synthesized in C/C++:
+Parentheses around `if`, `elif`, `while`, `for`, and `switch` conditions are omitted in Pura and automatically synthesized in C/C++:
 
 1. **Conditionals (`if` / `elif` / `else`):**
    ```python
@@ -433,70 +433,70 @@ var_decl       = [ "const" | "static" | "extern" ] ident ":" type_spec [ "=" exp
 type_alias     = "type" ident "=" type_spec ;
 range_clause   = ident [ ":" type_spec ] "in" ( "range" "(" expr [ "," expr [ "," expr ] ] ")" | expr ) ;
 
-directive_line = ( "import" ( strata_module | c_header_file )
-                 | "from" ( strata_module | c_header_file ) "import" ( "*" | ident_list )
+directive_line = ( "import" ( pura_module | c_header_file )
+                 | "from" ( pura_module | c_header_file ) "import" ( "*" | ident_list )
                  | macro_assign
                  | "define" ident [ expr ]
                  | ( "ifdef" | "ifndef" | "pragma" ) rest_of_line
                  | "endif" ) EOL ;
 macro_assign   = ident [ "(" [ ident_list ] ")" ] "=" expr ; (* Top-level untyped `=` -> #define *)
-strata_module  = ident ;                       (* Extensionless: resolves to .st module -> "ident.h" *)
+pura_module    = ident ;                       (* Extensionless: resolves to .pu module -> "ident.h" *)
 c_header_file  = path_stem "." ( "h" | "c" | "hpp" ) ; (* Explicit extension: resolves to <path.h> *)
 ```
 
 ---
 
-## Single-File C Reference Implementation (`strata.c`)
+## Single-File C Reference Implementation (`pura.c`)
 
-[`strata.c`](strata.c) is a zero-dependency C11 library and CLI tool providing bidirectional Strata ↔ C/C++ transpilation, syntax validation, formatting, direct compilation, and benchmarking.
+[`pura.c`](pura.c) is a zero-dependency C11 library and CLI tool providing bidirectional Pura ↔ C/C++ transpilation, syntax validation, formatting, direct compilation, and benchmarking.
 
 ### Build & CLI Usage
 
 ```sh
-# Build the strata binary
-cc -O3 -std=c11 -Wall -Wextra strata.c -o strata
+# Build the pura binary
+cc -O3 -std=c11 -Wall -Wextra pura.c -o pura
 
-# Transpile a .st file to C/C++ on stdout
-./strata examples/hello.st
+# Transpile a .pu file to C/C++ on stdout
+./pura examples/hello.pu
 
 # Transpile, compile with cc, and run immediately
-./strata --run examples/hello.st
+./pura --run examples/hello.pu
 
-# Compile a .st file directly to a native binary
-./strata --compile examples/shapes.st -o shapes && ./shapes
+# Compile a .pu file directly to a native binary
+./pura --compile examples/shapes.pu -o shapes && ./shapes
 
-# Format/canonicalize Strata (default 4 spaces, or any N spaces / tab)
-./strata --strata examples/hello.st
-./strata --strata --indent tab examples/hello.st
+# Format/canonicalize Pura (default 4 spaces, or any N spaces / tab)
+./pura --pura examples/hello.pu
+./pura --pura --indent tab examples/hello.pu
 
-# Convert existing C/C++ source code into Strata
-./strata --from-c input.c
-./strata --from-c --indent tab input.c
+# Convert existing C/C++ source code into Pura
+./pura --from-c input.c
+./pura --from-c --indent tab input.c
 
-# Validate Strata syntax & indentation rules only
-./strata --check examples/hello.st
+# Validate Pura syntax & indentation rules only
+./pura --check examples/hello.pu
 
 # Run built-in conformance tests & throughput benchmark
-./strata --test && ./strata --bench
+./pura --test && ./pura --bench
 ```
 
 ### Examples Directory
 
-See [`examples/`](examples/) for sample `.st` programs ready to transpile or run:
+See [`examples/`](examples/) for sample `.pu` programs ready to transpile or run:
 
-- [`examples/hello.st`](examples/hello.st) — Minimal introduction to Strata types, `def` functions, `for ..` ranges, and `and`/`or`/`not`
-- [`examples/shapes.st`](examples/shapes.st) — `struct`, `enum`, pointers, and `switch`/`case` geometry calculator
-- [`examples/tabs.st`](examples/tabs.st) — Tab-indented Fibonacci calculator demonstrating auto-detected `\t` indentation and inclusive `2..=n` ranges
-- [`examples/cal.st`](examples/cal.st) — Full real-world Unix `cal` CLI utility ported from [`util-linux/misc-utils/cal.c`](https://raw.githubusercontent.com/util-linux/util-linux/refs/heads/master/misc-utils/cal.c) (Gregorian 1752 reformation, Julian `-j`, ISO/US week numbers `-w`, `-1`/`-3`/`-y`/`-Y`/`-n`/`-S`, vertical `-v`, and ANSI highlight)
+- [`examples/hello.pu`](examples/hello.pu) — Minimal introduction to Pura types, `def` functions, `range()` loops, and `and`/`or`/`not`
+- [`examples/shapes.pu`](examples/shapes.pu) — `struct`, `enum`, `addr[T]` pointers, and `switch`/`case` geometry calculator
+- [`examples/tabs.pu`](examples/tabs.pu) — Tab-indented Fibonacci calculator demonstrating auto-detected `\t` indentation and `range(2, n + 1)`
+- [`examples/cal.pu`](examples/cal.pu) — Full real-world Unix `cal` CLI utility ported from [`util-linux/misc-utils/cal.c`](https://raw.githubusercontent.com/util-linux/util-linux/refs/heads/master/misc-utils/cal.c) (Gregorian 1752 reformation, Julian `-j`, ISO/US week numbers `-w`, `-1`/`-3`/`-y`/`-Y`/`-n`/`-S`, vertical `-v`, and ANSI highlight)
 
 ---
 
-## Benchmarks: Strata vs C Source Size & Transpilation Speed
+## Benchmarks: Pura vs C Source Size & Transpilation Speed
 
 Measured on macOS (`Clang -O3`) across a 250-function systems module (`Node` structs, pointer arithmetic, loops, and multi-branch conditionals):
 
-| Metric | 4-Space Strata (`.st`) | Tab `\t` Strata (`.st`) | Equivalent C (`.c`) |
+| Metric | 4-Space Pura (`.pu`) | Tab `\t` Pura (`.pu`) | Equivalent C (`.c`) |
 | :--- | :--- | :--- | :--- |
 | **Source Payload Size** | **`83.2 KiB`** (`-9.8%` vs C) | **`70.0 KiB`** (**`-24.1%`** vs C) | `92.2 KiB` (`94,435` bytes) |
-| **Strata → C Speed** | **`2,772 files/s`** (`225.1 MiB/s`) | **`3,155 files/s`** (`215.6 MiB/s`) | — |
-| **C → Strata Speed** | **`1,676 files/s`** (`150.9 MiB/s`) | **`1,710 files/s`** (`154.0 MiB/s`) | — |
+| **Pura → C Speed** | **`2,772 files/s`** (`225.1 MiB/s`) | **`3,155 files/s`** (`215.6 MiB/s`) | — |
+| **C → Pura Speed** | **`1,676 files/s`** (`150.9 MiB/s`) | **`1,710 files/s`** (`154.0 MiB/s`) | — |

@@ -1,26 +1,26 @@
 /*
- * Strata — Pythonic C/C++ Bidirectional Transpiler (single-file C11 implementation).
+ * Pura — Pythonic C/C++ Bidirectional Transpiler (single-file C11 implementation).
  *
- * Strata is to C/C++ what LMON is to JSON:
+ * Pura is to C/C++ what LMON is to JSON:
  *   - Strict, lossless 1-to-1 structural equivalence with C and C++
  *   - Pythonic indentation (`:` blocks instead of `{` `}`, no trailing `;` noise)
  *   - Pythonic declarations (`def fn(a: i32) -> i32:`, `x: i32 = 10`)
  *   - Pythonic keywords & operators (`elif`, `and`, `or`, `not`, `nil`, `pass`)
- *   - Bracket-free `import`: extensionless `import module` for `.st` modules, `import stdio.h` for `.h`/`.c` files
+ *   - Bracket-free `import`: extensionless `import module` for `.pu` modules, `import stdio.h` for `.h`/`.c` files
  *   - Concise fixed-width & C/C++ type aliases (`i8`..`i64`, `u8`..`u64`, `f32`, `f64`, `usize`, `isize`, `str`, `cstr`, `byte`)
  *   - Auto-detected indentation (any consistent spaces or tabs) & universal newlines (\n, \r\n, \r)
- *   - Embeddable as a library (#define STRATA_NO_MAIN before including/compiling)
+ *   - Embeddable as a library (#define PURA_NO_MAIN before including/compiling)
  *
  * Build & CLI usage:
- *   cc -O3 -std=c11 -Wall -Wextra strata.c -o strata
- *   ./strata examples/hello.st
- *   ./strata --strata [--indent <N|tab>] examples/hello.st
- *   ./strata --from-c examples/hello.c
- *   ./strata --compile examples/hello.st -o hello
- *   ./strata --run examples/hello.st
- *   ./strata --check examples/hello.st
- *   ./strata --test
- *   ./strata --bench [file.st]
+ *   cc -O3 -std=c11 -Wall -Wextra pura.c -o pura
+ *   ./pura examples/hello.pu
+ *   ./pura --pura [--indent <N|tab>] examples/hello.pu
+ *   ./pura --from-c examples/hello.c
+ *   ./pura --compile examples/hello.pu -o hello
+ *   ./pura --run examples/hello.pu
+ *   ./pura --check examples/hello.pu
+ *   ./pura --test
+ *   ./pura --bench [file.pu]
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -45,15 +45,15 @@ typedef struct {
     const char *message;
     size_t line;
     size_t col;
-} StrataError;
+} PuraError;
 
 typedef struct {
     char *data;
     size_t len;
     size_t cap;
-} StrataBuf;
+} PuraBuf;
 
-static bool strata_buf_init(StrataBuf *b, size_t initial_cap) {
+static bool pura_buf_init(PuraBuf *b, size_t initial_cap) {
     if (initial_cap < 64) initial_cap = 64;
     b->data = (char *)malloc(initial_cap);
     if (!b->data) {
@@ -67,14 +67,14 @@ static bool strata_buf_init(StrataBuf *b, size_t initial_cap) {
     return true;
 }
 
-static void strata_buf_free(StrataBuf *b) {
+static void pura_buf_free(PuraBuf *b) {
     free(b->data);
     b->data = NULL;
     b->len = 0;
     b->cap = 0;
 }
 
-static bool strata_buf_reserve(StrataBuf *b, size_t extra) {
+static bool pura_buf_reserve(PuraBuf *b, size_t extra) {
     if (b->len + extra + 1 <= b->cap) return true;
     size_t ncap = b->cap ? b->cap : 64;
     while (ncap < b->len + extra + 1) ncap *= 2;
@@ -85,27 +85,27 @@ static bool strata_buf_reserve(StrataBuf *b, size_t extra) {
     return true;
 }
 
-static void strata_buf_append(StrataBuf *b, const char *s, size_t n) {
+static void pura_buf_append(PuraBuf *b, const char *s, size_t n) {
     if (n == 0) return;
-    if (!strata_buf_reserve(b, n)) return;
+    if (!pura_buf_reserve(b, n)) return;
     memcpy(b->data + b->len, s, n);
     b->len += n;
     b->data[b->len] = '\0';
 }
 
-static void strata_buf_puts(StrataBuf *b, const char *s) {
-    strata_buf_append(b, s, strlen(s));
+static void pura_buf_puts(PuraBuf *b, const char *s) {
+    pura_buf_append(b, s, strlen(s));
 }
 
-static void strata_buf_putc(StrataBuf *b, char c) {
-    if (!strata_buf_reserve(b, 1)) return;
+static void pura_buf_putc(PuraBuf *b, char c) {
+    if (!pura_buf_reserve(b, 1)) return;
     b->data[b->len++] = c;
     b->data[b->len] = '\0';
 }
 
-static void strata_buf_indent(StrataBuf *b, const char *unit, size_t unit_len, size_t level) {
+static void pura_buf_indent(PuraBuf *b, const char *unit, size_t unit_len, size_t level) {
     for (size_t i = 0; i < level; i++) {
-        strata_buf_append(b, unit, unit_len);
+        pura_buf_append(b, unit, unit_len);
     }
 }
 
@@ -122,7 +122,7 @@ static inline bool is_ident_cont(char c) {
 }
 
 typedef struct {
-    const char *strata_type;
+    const char *pura_type;
     const char *c_type;
 } TypeMapping;
 
@@ -166,9 +166,9 @@ typedef struct {
     size_t num_tags;
     PtrVarEntry ptrs[256];
     size_t num_ptrs;
-} StrataSymTab;
+} PuraSymTab;
 
-static StrataSymTab g_sym;
+static PuraSymTab g_sym;
 
 static void symtab_reset(void) {
     g_sym.num_tags = 0;
@@ -235,7 +235,7 @@ static bool symtab_is_ptr_var(const char *name, size_t nlen) {
     return false;
 }
 
-static bool is_strata_ptr_type(const char *type_s, size_t type_len) {
+static bool is_pura_ptr_type(const char *type_s, size_t type_len) {
     while (type_len > 0 && type_s[0] == ' ') { type_s++; type_len--; }
     while (type_len > 0 && type_s[type_len - 1] == ' ') type_len--;
     if (type_len >= 6 && memcmp(type_s, "addr[", 5) == 0 && type_s[type_len - 1] == ']') return true;
@@ -243,10 +243,10 @@ static bool is_strata_ptr_type(const char *type_s, size_t type_len) {
     return false;
 }
 
-static const char *map_strata_word_to_c(const char *w, size_t len) {
+static const char *map_pura_word_to_c(const char *w, size_t len) {
     for (size_t i = 0; i < TYPE_MAP_COUNT; i++) {
-        if (strlen(TYPE_MAP[i].strata_type) == len &&
-            memcmp(w, TYPE_MAP[i].strata_type, len) == 0) {
+        if (strlen(TYPE_MAP[i].pura_type) == len &&
+            memcmp(w, TYPE_MAP[i].pura_type, len) == 0) {
             return TYPE_MAP[i].c_type;
         }
     }
@@ -261,13 +261,13 @@ static const char *map_strata_word_to_c(const char *w, size_t len) {
     return NULL;
 }
 
-static const char *map_c_word_to_strata(const char *w, size_t len) {
+static const char *map_c_word_to_pura(const char *w, size_t len) {
     for (size_t i = 0; i < TYPE_MAP_COUNT; i++) {
         /* Skip duplicate uint8_t -> byte, prefer u8 */
-        if (strcmp(TYPE_MAP[i].strata_type, "byte") == 0) continue;
+        if (strcmp(TYPE_MAP[i].pura_type, "byte") == 0) continue;
         if (strlen(TYPE_MAP[i].c_type) == len &&
             memcmp(w, TYPE_MAP[i].c_type, len) == 0) {
-            return TYPE_MAP[i].strata_type;
+            return TYPE_MAP[i].pura_type;
         }
     }
     if (len == 4 && memcmp(w, "NULL", 4) == 0) return "nil";
@@ -276,25 +276,25 @@ static const char *map_c_word_to_strata(const char *w, size_t len) {
     return NULL;
 }
 
-static void translate_tokens_strata_to_c(StrataBuf *out, const char *s, size_t len);
+static void translate_tokens_pura_to_c(PuraBuf *out, const char *s, size_t len);
 
-/* Translate a Strata type specification (supporting `addr[T]` and automatic `struct`/`enum`/`union` prefix) to C */
-static void translate_type_strata_to_c(StrataBuf *out, const char *s, size_t len) {
+/* Translate a Pura type specification (supporting `addr[T]` and automatic `struct`/`enum`/`union` prefix) to C */
+static void translate_type_pura_to_c(PuraBuf *out, const char *s, size_t len) {
     while (len > 0 && s[0] == ' ') { s++; len--; }
     while (len > 0 && s[len - 1] == ' ') len--;
     if (len == 0) return;
 
     /* `addr[T]` -> `<C type of T>*` */
     if (len >= 6 && memcmp(s, "addr[", 5) == 0 && s[len - 1] == ']') {
-        translate_type_strata_to_c(out, s + 5, len - 6);
-        strata_buf_putc(out, '*');
+        translate_type_pura_to_c(out, s + 5, len - 6);
+        pura_buf_putc(out, '*');
         return;
     }
 
     /* Check leading `const ` */
     if (len > 6 && memcmp(s, "const ", 6) == 0) {
-        strata_buf_puts(out, "const ");
-        translate_type_strata_to_c(out, s + 6, len - 6);
+        pura_buf_puts(out, "const ");
+        translate_type_pura_to_c(out, s + 6, len - 6);
         return;
     }
 
@@ -302,7 +302,7 @@ static void translate_type_strata_to_c(StrataBuf *out, const char *s, size_t len
     if ((len > 7 && memcmp(s, "struct ", 7) == 0) ||
         (len > 5 && memcmp(s, "enum ", 5) == 0) ||
         (len > 6 && memcmp(s, "union ", 6) == 0)) {
-        translate_tokens_strata_to_c(out, s, len);
+        translate_tokens_pura_to_c(out, s, len);
         return;
     }
 
@@ -312,11 +312,11 @@ static void translate_type_strata_to_c(StrataBuf *out, const char *s, size_t len
     if (id_len > 0) {
         const char *tag_kind = symtab_find_tag_kind(s, id_len);
         if (tag_kind) {
-            strata_buf_puts(out, tag_kind);
-            strata_buf_putc(out, ' ');
+            pura_buf_puts(out, tag_kind);
+            pura_buf_putc(out, ' ');
         }
     }
-    translate_tokens_strata_to_c(out, s, len);
+    translate_tokens_pura_to_c(out, s, len);
 }
 
 /* Find matching closing `)` for `(` at `open_idx` */
@@ -340,10 +340,10 @@ static size_t find_matching_paren(const char *s, size_t len, size_t open_idx) {
     return len;
 }
 
-static bool is_strata_type_word(const char *w, size_t len) {
+static bool is_pura_type_word(const char *w, size_t len) {
     for (size_t i = 0; i < TYPE_MAP_COUNT; i++) {
-        if (strlen(TYPE_MAP[i].strata_type) == len &&
-            memcmp(w, TYPE_MAP[i].strata_type, len) == 0) {
+        if (strlen(TYPE_MAP[i].pura_type) == len &&
+            memcmp(w, TYPE_MAP[i].pura_type, len) == 0) {
             return true;
         }
     }
@@ -375,7 +375,7 @@ static bool is_c_cast_type_slice(const char *s, size_t len) {
     for (size_t i = 0; i < len; i++) {
         if (!is_ident_cont(s[i])) return false;
     }
-    if (map_c_word_to_strata(s, len) != NULL) return true;
+    if (map_c_word_to_pura(s, len) != NULL) return true;
     if (symtab_find_tag_kind(s, len) != NULL) return true;
     if (len == 4 && (memcmp(s, "char", 4) == 0 || memcmp(s, "void", 4) == 0 ||
                      memcmp(s, "long", 4) == 0 || memcmp(s, "bool", 4) == 0)) return true;
@@ -385,11 +385,11 @@ static bool is_c_cast_type_slice(const char *s, size_t len) {
     return false;
 }
 
-static void emit_cast_strata_to_c(StrataBuf *out, const char *type_s, size_t type_len,
+static void emit_cast_pura_to_c(PuraBuf *out, const char *type_s, size_t type_len,
                                   const char *inner, size_t inner_len) {
-    strata_buf_putc(out, '(');
-    translate_type_strata_to_c(out, type_s, type_len);
-    strata_buf_putc(out, ')');
+    pura_buf_putc(out, '(');
+    translate_type_pura_to_c(out, type_s, type_len);
+    pura_buf_putc(out, ')');
     bool simple_postfix = true;
     int pdepth = 0;
     for (size_t k = 0; k < inner_len; k++) {
@@ -404,28 +404,28 @@ static void emit_cast_strata_to_c(StrataBuf *out, const char *type_s, size_t typ
         }
     }
     if (simple_postfix) {
-        translate_tokens_strata_to_c(out, inner, inner_len);
+        translate_tokens_pura_to_c(out, inner, inner_len);
     } else {
-        strata_buf_putc(out, '(');
-        translate_tokens_strata_to_c(out, inner, inner_len);
-        strata_buf_putc(out, ')');
+        pura_buf_putc(out, '(');
+        translate_tokens_pura_to_c(out, inner, inner_len);
+        pura_buf_putc(out, ')');
     }
 }
 
-/* Translate expression/type tokens from Strata to C, respecting string/char literals */
-static void translate_tokens_strata_to_c(StrataBuf *out, const char *s, size_t len) {
+/* Translate expression/type tokens from Pura to C, respecting string/char literals */
+static void translate_tokens_pura_to_c(PuraBuf *out, const char *s, size_t len) {
     size_t i = 0;
     while (i < len) {
         char c = s[i];
         if (c == '"' || c == '\'') {
             char quote = c;
-            strata_buf_putc(out, c);
+            pura_buf_putc(out, c);
             i++;
             while (i < len) {
                 char sc = s[i++];
-                strata_buf_putc(out, sc);
+                pura_buf_putc(out, sc);
                 if (sc == '\\' && i < len) {
-                    strata_buf_putc(out, s[i++]);
+                    pura_buf_putc(out, s[i++]);
                 } else if (sc == quote) {
                     break;
                 }
@@ -455,7 +455,7 @@ static void translate_tokens_strata_to_c(StrataBuf *out, const char *s, size_t l
                     close_b++;
                 }
                 if (close_b < len) {
-                    translate_type_strata_to_c(out, s + start, close_b - start + 1);
+                    translate_type_pura_to_c(out, s + start, close_b - start + 1);
                     i = close_b + 1;
                     continue;
                 }
@@ -490,7 +490,7 @@ static void translate_tokens_strata_to_c(StrataBuf *out, const char *s, size_t l
                         while (val_len > 0 && val_s[0] == ' ') { val_s++; val_len--; }
                         while (val_len > 0 && val_s[val_len - 1] == ' ') val_len--;
 
-                        emit_cast_strata_to_c(out, type_s, type_len, val_s, val_len);
+                        emit_cast_pura_to_c(out, type_s, type_len, val_s, val_len);
                         i = close_p + 1;
                         continue;
                     }
@@ -498,10 +498,10 @@ static void translate_tokens_strata_to_c(StrataBuf *out, const char *s, size_t l
             }
 
             /* Pythonic scalar value conversion: `u8(x)`, `i32(x)`, `usize(x)`, `f64(x)` -> `(uint8_t)x` */
-            if (!is_member && i < len && s[i] == '(' && is_strata_type_word(s + start, wlen)) {
+            if (!is_member && i < len && s[i] == '(' && is_pura_type_word(s + start, wlen)) {
                 size_t close_p = find_matching_paren(s, len, i);
                 if (close_p < len) {
-                    emit_cast_strata_to_c(out, s + start, wlen, s + i + 1, close_p - (i + 1));
+                    emit_cast_pura_to_c(out, s + start, wlen, s + i + 1, close_p - (i + 1));
                     i = close_p + 1;
                     continue;
                 }
@@ -514,7 +514,7 @@ static void translate_tokens_strata_to_c(StrataBuf *out, const char *s, size_t l
                 if (close_p < len) {
                     const char *inner = s + i + 1;
                     size_t inner_len = close_p - (i + 1);
-                    strata_buf_putc(out, '*');
+                    pura_buf_putc(out, '*');
                     bool simple_postfix = true;
                     int pdepth = 0;
                     for (size_t k = 0; k < inner_len; k++) {
@@ -530,11 +530,11 @@ static void translate_tokens_strata_to_c(StrataBuf *out, const char *s, size_t l
                         }
                     }
                     if (simple_postfix) {
-                        translate_tokens_strata_to_c(out, inner, inner_len);
+                        translate_tokens_pura_to_c(out, inner, inner_len);
                     } else {
-                        strata_buf_putc(out, '(');
-                        translate_tokens_strata_to_c(out, inner, inner_len);
-                        strata_buf_putc(out, ')');
+                        pura_buf_putc(out, '(');
+                        translate_tokens_pura_to_c(out, inner, inner_len);
+                        pura_buf_putc(out, ')');
                     }
                     i = close_p + 1;
                     continue;
@@ -554,10 +554,10 @@ static void translate_tokens_strata_to_c(StrataBuf *out, const char *s, size_t l
                         }
                     } else if (scan + 5 <= len && memcmp(s + scan, ".addr", 5) == 0 &&
                                (scan + 5 == len || !is_ident_cont(s[scan + 5]))) {
-                        strata_buf_putc(out, '&');
-                        translate_tokens_strata_to_c(out, s + start, scan - start);
+                        pura_buf_putc(out, '&');
+                        translate_tokens_pura_to_c(out, s + start, scan - start);
                         i = scan + 5;
-                        goto next_strata_tok;
+                        goto next_pura_tok;
                     } else if (s[scan] == '.' && scan + 1 < len && is_ident_start(s[scan + 1])) {
                         scan++;
                         while (scan < len && is_ident_cont(s[scan])) scan++;
@@ -567,44 +567,44 @@ static void translate_tokens_strata_to_c(StrataBuf *out, const char *s, size_t l
                 }
             }
 
-            const char *rep = is_member ? NULL : map_strata_word_to_c(s + start, wlen);
+            const char *rep = is_member ? NULL : map_pura_word_to_c(s + start, wlen);
             if (rep) {
                 if (strcmp(rep, "!") == 0 && i < len && s[i] == ' ') {
-                    strata_buf_putc(out, '!');
+                    pura_buf_putc(out, '!');
                     i++; /* consume space after `not ` so `not x` -> `!x` */
                 } else {
-                    strata_buf_puts(out, rep);
+                    pura_buf_puts(out, rep);
                 }
             } else {
                 /* If identifier is a registered struct/enum/union tag inside `sizeof(Name)` or `(Name)` cast */
                 const char *tag_kind = is_member ? NULL : symtab_find_tag_kind(s + start, wlen);
                 if (tag_kind && start > 0 && s[start - 1] == '(' &&
                     i < len && (s[i] == ')' || s[i] == '*')) {
-                    strata_buf_puts(out, tag_kind);
-                    strata_buf_putc(out, ' ');
+                    pura_buf_puts(out, tag_kind);
+                    pura_buf_putc(out, ' ');
                 }
-                strata_buf_append(out, s + start, wlen);
+                pura_buf_append(out, s + start, wlen);
             }
 
             /* Unified `.` member access: if this identifier is a known pointer variable (`ctl`, `month`, `self`, etc.)
                and is immediately followed by `.` + identifier, emit `->` instead of `.`! */
             if (!is_member && i + 1 < len && s[i] == '.' && is_ident_start(s[i + 1]) &&
                 symtab_is_ptr_var(s + start, wlen)) {
-                strata_buf_puts(out, "->");
+                pura_buf_puts(out, "->");
                 i++; /* skip '.' */
             }
-next_strata_tok:
+next_pura_tok:
             continue;
         }
-        strata_buf_putc(out, c);
+        pura_buf_putc(out, c);
         i++;
     }
 }
 
-static void translate_tokens_c_to_strata(StrataBuf *out, const char *s, size_t len);
+static void translate_tokens_c_to_pura(PuraBuf *out, const char *s, size_t len);
 
-/* Translate a C type specification into Strata (`T*` -> `addr[T]`, dropping redundant `struct`/`enum`/`union` for known tags) */
-static void translate_type_c_to_strata(StrataBuf *out, const char *s, size_t len) {
+/* Translate a C type specification into Pura (`T*` -> `addr[T]`, dropping redundant `struct`/`enum`/`union` for known tags) */
+static void translate_type_c_to_pura(PuraBuf *out, const char *s, size_t len) {
     while (len > 0 && s[0] == ' ') { s++; len--; }
     while (len > 0 && s[len - 1] == ' ') len--;
     if (len == 0) return;
@@ -612,32 +612,32 @@ static void translate_type_c_to_strata(StrataBuf *out, const char *s, size_t len
     /* Special primitive pointer aliases first (`const char*` -> `cstr`, `char*` -> `str`, `void*` -> `any`) */
     if ((len == 11 && memcmp(s, "const char*", 11) == 0) ||
         (len == 12 && memcmp(s, "const char *", 12) == 0)) {
-        strata_buf_puts(out, "cstr");
+        pura_buf_puts(out, "cstr");
         return;
     }
     if ((len == 5 && memcmp(s, "char*", 5) == 0) ||
         (len == 6 && memcmp(s, "char *", 6) == 0)) {
-        strata_buf_puts(out, "str");
+        pura_buf_puts(out, "str");
         return;
     }
     if ((len == 5 && memcmp(s, "void*", 5) == 0) ||
         (len == 6 && memcmp(s, "void *", 6) == 0)) {
-        strata_buf_puts(out, "any");
+        pura_buf_puts(out, "any");
         return;
     }
 
     /* Trailing `*` -> `addr[...]` */
     if (len > 1 && s[len - 1] == '*') {
-        strata_buf_puts(out, "addr[");
-        translate_type_c_to_strata(out, s, len - 1);
-        strata_buf_putc(out, ']');
+        pura_buf_puts(out, "addr[");
+        translate_type_c_to_pura(out, s, len - 1);
+        pura_buf_putc(out, ']');
         return;
     }
 
     /* Leading `const ` */
     if (len > 6 && memcmp(s, "const ", 6) == 0) {
-        strata_buf_puts(out, "const ");
-        translate_type_c_to_strata(out, s + 6, len - 6);
+        pura_buf_puts(out, "const ");
+        translate_type_c_to_pura(out, s + 6, len - 6);
         return;
     }
 
@@ -665,7 +665,7 @@ static void translate_type_c_to_strata(StrataBuf *out, const char *s, size_t len
         }
     }
 
-    translate_tokens_c_to_strata(out, s, len);
+    translate_tokens_c_to_pura(out, s, len);
 }
 
 /* Helper: check if C character before unary `&` or `*` indicates a unary prefix position */
@@ -715,20 +715,20 @@ static size_t scan_c_unary_operand(const char *s, size_t len, size_t start) {
     return i;
 }
 
-/* Translate expression/type tokens from C to Strata, respecting string/char literals */
-static void translate_tokens_c_to_strata(StrataBuf *out, const char *s, size_t len) {
+/* Translate expression/type tokens from C to Pura, respecting string/char literals */
+static void translate_tokens_c_to_pura(PuraBuf *out, const char *s, size_t len) {
     size_t i = 0;
     while (i < len) {
         char c = s[i];
         if (c == '"' || c == '\'') {
             char quote = c;
-            strata_buf_putc(out, c);
+            pura_buf_putc(out, c);
             i++;
             while (i < len) {
                 char sc = s[i++];
-                strata_buf_putc(out, sc);
+                pura_buf_putc(out, sc);
                 if (sc == '\\' && i < len) {
-                    strata_buf_putc(out, s[i++]);
+                    pura_buf_putc(out, s[i++]);
                 } else if (sc == quote) {
                     break;
                 }
@@ -738,54 +738,54 @@ static void translate_tokens_c_to_strata(StrataBuf *out, const char *s, size_t l
         /* Multi-word C types: `const char*` or `const char *` -> `cstr` */
         if (len - i >= 11 && memcmp(s + i, "const char*", 11) == 0 &&
             (i == 0 || !is_ident_cont(s[i - 1]))) {
-            strata_buf_puts(out, "cstr");
+            pura_buf_puts(out, "cstr");
             i += 11;
             if (i < len && s[i] == ' ') i++;
             continue;
         }
         if (len - i >= 12 && memcmp(s + i, "const char *", 12) == 0 &&
             (i == 0 || !is_ident_cont(s[i - 1]))) {
-            strata_buf_puts(out, "cstr");
+            pura_buf_puts(out, "cstr");
             i += 12;
             continue;
         }
         if (len - i >= 5 && memcmp(s + i, "char*", 5) == 0 &&
             (i == 0 || !is_ident_cont(s[i - 1]))) {
-            strata_buf_puts(out, "str");
+            pura_buf_puts(out, "str");
             i += 5;
             continue;
         }
         if (len - i >= 6 && memcmp(s + i, "char *", 6) == 0 &&
             (i == 0 || !is_ident_cont(s[i - 1]))) {
-            strata_buf_puts(out, "str ");
+            pura_buf_puts(out, "str ");
             i += 6;
             continue;
         }
         if (len - i >= 5 && memcmp(s + i, "void*", 5) == 0 &&
             (i == 0 || !is_ident_cont(s[i - 1]))) {
-            strata_buf_puts(out, "any");
+            pura_buf_puts(out, "any");
             i += 5;
             continue;
         }
         if (len - i >= 6 && memcmp(s + i, "void *", 6) == 0 &&
             (i == 0 || !is_ident_cont(s[i - 1]))) {
-            strata_buf_puts(out, "any ");
+            pura_buf_puts(out, "any ");
             i += 6;
             continue;
         }
-        /* Unified `.` member access in Strata: `ptr->member` -> `ptr.member` */
+        /* Unified `.` member access in Pura: `ptr->member` -> `ptr.member` */
         if (c == '-' && i + 1 < len && s[i + 1] == '>' &&
             i + 2 < len && is_ident_start(s[i + 2])) {
-            strata_buf_putc(out, '.');
+            pura_buf_putc(out, '.');
             i += 2;
             continue;
         }
         /* Logical operators: && -> and, || -> or, !x -> not x */
         if (c == '&' && i + 1 < len && s[i + 1] == '&') {
-            if (out->len > 0 && out->data[out->len - 1] != ' ') strata_buf_putc(out, ' ');
-            strata_buf_puts(out, "and");
+            if (out->len > 0 && out->data[out->len - 1] != ' ') pura_buf_putc(out, ' ');
+            pura_buf_puts(out, "and");
             i += 2;
-            if (i < len && s[i] != ' ') strata_buf_putc(out, ' ');
+            if (i < len && s[i] != ' ') pura_buf_putc(out, ' ');
             continue;
         }
         /* C prefix cast `(Type)expr` -> `cast(addr[T], expr)` for pointers or `Type(expr)` for scalars */
@@ -809,16 +809,16 @@ static void translate_tokens_c_to_strata(StrataBuf *out, const char *s, size_t l
 
                     bool is_ptr_cast = (type_len > 0 && type_s[type_len - 1] == '*');
                     if (is_ptr_cast) {
-                        strata_buf_puts(out, "cast(");
-                        translate_type_c_to_strata(out, type_s, type_len);
-                        strata_buf_puts(out, ", ");
-                        translate_tokens_c_to_strata(out, arg_s, arg_len);
-                        strata_buf_putc(out, ')');
+                        pura_buf_puts(out, "cast(");
+                        translate_type_c_to_pura(out, type_s, type_len);
+                        pura_buf_puts(out, ", ");
+                        translate_tokens_c_to_pura(out, arg_s, arg_len);
+                        pura_buf_putc(out, ')');
                     } else {
-                        translate_type_c_to_strata(out, type_s, type_len);
-                        strata_buf_putc(out, '(');
-                        translate_tokens_c_to_strata(out, arg_s, arg_len);
-                        strata_buf_putc(out, ')');
+                        translate_type_c_to_pura(out, type_s, type_len);
+                        pura_buf_putc(out, '(');
+                        translate_tokens_c_to_pura(out, arg_s, arg_len);
+                        pura_buf_putc(out, ')');
                     }
                     i = op_end;
                     continue;
@@ -830,8 +830,8 @@ static void translate_tokens_c_to_strata(StrataBuf *out, const char *s, size_t l
             is_c_unary_prefix_pos(s, i)) {
             size_t op_end = scan_c_unary_operand(s, len, i + 1);
             if (op_end > i + 1) {
-                translate_tokens_c_to_strata(out, s + i + 1, op_end - (i + 1));
-                strata_buf_puts(out, ".addr");
+                translate_tokens_c_to_pura(out, s + i + 1, op_end - (i + 1));
+                pura_buf_puts(out, ".addr");
                 i = op_end;
                 continue;
             }
@@ -841,22 +841,22 @@ static void translate_tokens_c_to_strata(StrataBuf *out, const char *s, size_t l
             is_c_unary_prefix_pos(s, i)) {
             size_t op_end = scan_c_unary_operand(s, len, i + 1);
             if (op_end > i + 1) {
-                strata_buf_puts(out, "val(");
-                translate_tokens_c_to_strata(out, s + i + 1, op_end - (i + 1));
-                strata_buf_putc(out, ')');
+                pura_buf_puts(out, "val(");
+                translate_tokens_c_to_pura(out, s + i + 1, op_end - (i + 1));
+                pura_buf_putc(out, ')');
                 i = op_end;
                 continue;
             }
         }
         if (c == '|' && i + 1 < len && s[i + 1] == '|') {
-            if (out->len > 0 && out->data[out->len - 1] != ' ') strata_buf_putc(out, ' ');
-            strata_buf_puts(out, "or");
+            if (out->len > 0 && out->data[out->len - 1] != ' ') pura_buf_putc(out, ' ');
+            pura_buf_puts(out, "or");
             i += 2;
-            if (i < len && s[i] != ' ') strata_buf_putc(out, ' ');
+            if (i < len && s[i] != ' ') pura_buf_putc(out, ' ');
             continue;
         }
         if (c == '!' && (i + 1 >= len || s[i + 1] != '=')) {
-            strata_buf_puts(out, "not ");
+            pura_buf_puts(out, "not ");
             i++;
             continue;
         }
@@ -868,21 +868,21 @@ static void translate_tokens_c_to_strata(StrataBuf *out, const char *s, size_t l
             if (start > 0 && s[start - 1] == '.') is_member = true;
             if (start > 1 && s[start - 2] == '-' && s[start - 1] == '>') is_member = true;
 
-            const char *rep = is_member ? NULL : map_c_word_to_strata(s + start, wlen);
+            const char *rep = is_member ? NULL : map_c_word_to_pura(s + start, wlen);
             if (rep) {
-                strata_buf_puts(out, rep);
+                pura_buf_puts(out, rep);
             } else {
-                strata_buf_append(out, s + start, wlen);
+                pura_buf_append(out, s + start, wlen);
             }
             continue;
         }
-        strata_buf_putc(out, c);
+        pura_buf_putc(out, c);
         i++;
     }
 }
 
 /* Format `name: type` (including array suffixes like `buf: char[64]`) into C `type name[64]` */
-static void emit_c_typed_decl(StrataBuf *out, const char *name_s, size_t name_len,
+static void emit_c_typed_decl(PuraBuf *out, const char *name_s, size_t name_len,
                               const char *type_s, size_t type_len) {
     /* Trim whitespace */
     while (name_len > 0 && name_s[0] == ' ') { name_s++; name_len--; }
@@ -906,25 +906,25 @@ static void emit_c_typed_decl(StrataBuf *out, const char *name_s, size_t name_le
     size_t base_type_len = bracket ? (size_t)(bracket - type_s) : type_len;
     while (base_type_len > 0 && type_s[base_type_len - 1] == ' ') base_type_len--;
 
-    translate_type_strata_to_c(out, type_s, base_type_len);
-    strata_buf_putc(out, ' ');
-    translate_tokens_strata_to_c(out, name_s, name_len);
+    translate_type_pura_to_c(out, type_s, base_type_len);
+    pura_buf_putc(out, ' ');
+    translate_tokens_pura_to_c(out, name_s, name_len);
     if (bracket) {
         size_t arr_len = type_len - (size_t)(bracket - type_s);
-        translate_tokens_strata_to_c(out, bracket, arr_len);
+        translate_tokens_pura_to_c(out, bracket, arr_len);
     }
 }
 
-/* Convert a Strata parameter list `(a: i32, b: cstr = nil)` into C `(int32_t a, const char* b = NULL)` */
-static void emit_c_param_list(StrataBuf *out, const char *params, size_t len, size_t param_scope_level) {
+/* Convert a Pura parameter list `(a: i32, b: cstr = nil)` into C `(int32_t a, const char* b = NULL)` */
+static void emit_c_param_list(PuraBuf *out, const char *params, size_t len, size_t param_scope_level) {
     while (len > 0 && params[0] == ' ') { params++; len--; }
     while (len > 0 && params[len - 1] == ' ') len--;
     if (len == 0) {
-        strata_buf_puts(out, "void");
+        pura_buf_puts(out, "void");
         return;
     }
     if (len == 4 && memcmp(params, "void", 4) == 0) {
-        strata_buf_puts(out, "void");
+        pura_buf_puts(out, "void");
         return;
     }
 
@@ -955,11 +955,11 @@ static void emit_c_param_list(StrataBuf *out, const char *params, size_t len, si
         while (plen > 0 && p[plen - 1] == ' ') plen--;
         if (plen == 0) continue;
 
-        if (!first) strata_buf_puts(out, ", ");
+        if (!first) pura_buf_puts(out, ", ");
         first = false;
 
         if (plen == 3 && memcmp(p, "...", 3) == 0) {
-            strata_buf_puts(out, "...");
+            pura_buf_puts(out, "...");
             continue;
         }
 
@@ -1011,27 +1011,27 @@ static void emit_c_param_list(StrataBuf *out, const char *params, size_t len, si
                 }
             }
             size_t actual_tlen = eq ? (size_t)(eq - rest) : rlen;
-            if (is_strata_ptr_type(rest, actual_tlen)) {
+            if (is_pura_ptr_type(rest, actual_tlen)) {
                 symtab_add_ptr_var(p, nlen, param_scope_level);
             }
             if (eq) {
                 emit_c_typed_decl(out, p, nlen, rest, (size_t)(eq - rest));
-                strata_buf_puts(out, " = ");
+                pura_buf_puts(out, " = ");
                 const char *defv = eq + 1;
                 size_t deflen = rlen - (size_t)(defv - rest);
                 while (deflen > 0 && defv[0] == ' ') { defv++; deflen--; }
-                translate_tokens_strata_to_c(out, defv, deflen);
+                translate_tokens_pura_to_c(out, defv, deflen);
             } else {
                 emit_c_typed_decl(out, p, nlen, rest, rlen);
             }
         } else {
-            translate_tokens_strata_to_c(out, p, plen);
+            translate_tokens_pura_to_c(out, p, plen);
         }
     }
 }
 
 /* -------------------------------------------------------------------------
- * Strata -> C/C++ Transpiler
+ * Pura -> C/C++ Transpiler
  * ------------------------------------------------------------------------- */
 
 typedef enum {
@@ -1145,7 +1145,7 @@ static const char *split_inline_hash_comment(const char *s, size_t len, size_t *
 }
 
 /* Check if a root-level statement `NAME = val` or `NAME(args) = val` is a Pythonic `#define` macro */
-static bool try_emit_strata_macro_define(StrataBuf *out, const char *s, size_t len) {
+static bool try_emit_pura_macro_define(PuraBuf *out, const char *s, size_t len) {
     if (len == 0 || !is_ident_start(s[0])) return false;
 
     size_t i = 1;
@@ -1177,14 +1177,14 @@ static bool try_emit_strata_macro_define(StrataBuf *out, const char *s, size_t l
     while (rhs_len > 0 && rhs[0] == ' ') { rhs++; rhs_len--; }
     if (rhs_len == 0) return false;
 
-    strata_buf_puts(out, "#define ");
-    strata_buf_append(out, s, sig_end);
-    strata_buf_putc(out, ' ');
-    translate_tokens_strata_to_c(out, rhs, rhs_len);
+    pura_buf_puts(out, "#define ");
+    pura_buf_append(out, s, sig_end);
+    pura_buf_putc(out, ' ');
+    translate_tokens_pura_to_c(out, rhs, rhs_len);
     return true;
 }
 
-static bool emit_strata_function_def(StrataBuf *out, const char *prefix_qual,
+static bool emit_pura_function_def(PuraBuf *out, const char *prefix_qual,
                                      const char *rest, size_t rlen, bool is_block,
                                      size_t body_scope_level) {
     /* Expect `name(params) -> ret` or `name(params)` */
@@ -1251,29 +1251,29 @@ static bool emit_strata_function_def(StrataBuf *out, const char *prefix_qual,
     }
 
     if (prefix_qual && prefix_qual[0]) {
-        strata_buf_puts(out, prefix_qual);
-        strata_buf_putc(out, ' ');
+        pura_buf_puts(out, prefix_qual);
+        pura_buf_putc(out, ' ');
     }
     if (ret_len > 0) {
-        translate_type_strata_to_c(out, ret_str, ret_len);
-        strata_buf_putc(out, ' ');
+        translate_type_pura_to_c(out, ret_str, ret_len);
+        pura_buf_putc(out, ' ');
     }
-    translate_tokens_strata_to_c(out, rest, fname_len);
-    strata_buf_putc(out, '(');
+    translate_tokens_pura_to_c(out, rest, fname_len);
+    pura_buf_putc(out, '(');
     emit_c_param_list(out, lparen + 1, (size_t)(rparen - lparen - 1), body_scope_level);
-    strata_buf_putc(out, ')');
-    strata_buf_puts(out, const_qual);
+    pura_buf_putc(out, ')');
+    pura_buf_puts(out, const_qual);
     if (is_block) {
-        strata_buf_puts(out, " {");
+        pura_buf_puts(out, " {");
     } else {
-        strata_buf_putc(out, ';');
+        pura_buf_putc(out, ';');
     }
     return true;
 }
 
 /* Convert Pythonic `for i in range(stop):`, `for i in range(start, stop):`, `for i in range(start, stop, step):`,
    or `for x: T in range(...):` */
-static bool try_emit_for_in(StrataBuf *out, const char *expr, size_t len) {
+static bool try_emit_for_in(PuraBuf *out, const char *expr, size_t len) {
     /* Look for ` in ` at depth 0 */
     int depth = 0;
     const char *in_pos = NULL;
@@ -1351,28 +1351,28 @@ static bool try_emit_for_in(StrataBuf *out, const char *expr, size_t len) {
 
             bool neg_step = (step_s && step_l > 0 && step_s[0] == '-');
 
-            strata_buf_puts(out, "for (");
+            pura_buf_puts(out, "for (");
             emit_c_typed_decl(out, vname, vname_len, vtype, vtype_len);
-            strata_buf_puts(out, " = ");
-            translate_tokens_strata_to_c(out, start_s, start_l);
-            strata_buf_puts(out, "; ");
-            translate_tokens_strata_to_c(out, vname, vname_len);
-            strata_buf_puts(out, neg_step ? " > " : " < ");
-            translate_tokens_strata_to_c(out, stop_s, stop_l);
-            strata_buf_puts(out, "; ");
-            translate_tokens_strata_to_c(out, vname, vname_len);
+            pura_buf_puts(out, " = ");
+            translate_tokens_pura_to_c(out, start_s, start_l);
+            pura_buf_puts(out, "; ");
+            translate_tokens_pura_to_c(out, vname, vname_len);
+            pura_buf_puts(out, neg_step ? " > " : " < ");
+            translate_tokens_pura_to_c(out, stop_s, stop_l);
+            pura_buf_puts(out, "; ");
+            translate_tokens_pura_to_c(out, vname, vname_len);
             if (!step_s || (step_l == 1 && step_s[0] == '1')) {
-                strata_buf_puts(out, "++");
+                pura_buf_puts(out, "++");
             } else if (neg_step && step_l == 2 && step_s[1] == '1') {
-                strata_buf_puts(out, "--");
+                pura_buf_puts(out, "--");
             } else if (neg_step) {
-                strata_buf_puts(out, " -= ");
-                translate_tokens_strata_to_c(out, step_s + 1, step_l - 1);
+                pura_buf_puts(out, " -= ");
+                translate_tokens_pura_to_c(out, step_s + 1, step_l - 1);
             } else {
-                strata_buf_puts(out, " += ");
-                translate_tokens_strata_to_c(out, step_s, step_l);
+                pura_buf_puts(out, " += ");
+                translate_tokens_pura_to_c(out, step_s, step_l);
             }
-            strata_buf_puts(out, ") {");
+            pura_buf_puts(out, ") {");
             return true;
         }
     }
@@ -1406,56 +1406,56 @@ static bool try_emit_for_in(StrataBuf *out, const char *expr, size_t len) {
         size_t bound_len = step_pos ? (size_t)(step_pos - end_expr) : end_len;
         while (bound_len > 0 && end_expr[bound_len - 1] == ' ') bound_len--;
 
-        strata_buf_puts(out, "for (");
+        pura_buf_puts(out, "for (");
         emit_c_typed_decl(out, vname, vname_len, vtype, vtype_len);
-        strata_buf_puts(out, " = ");
-        translate_tokens_strata_to_c(out, rhs, start_len);
-        strata_buf_puts(out, "; ");
-        translate_tokens_strata_to_c(out, vname, vname_len);
-        strata_buf_puts(out, inclusive ? " <= " : " < ");
-        translate_tokens_strata_to_c(out, end_expr, bound_len);
-        strata_buf_puts(out, "; ");
-        translate_tokens_strata_to_c(out, vname, vname_len);
+        pura_buf_puts(out, " = ");
+        translate_tokens_pura_to_c(out, rhs, start_len);
+        pura_buf_puts(out, "; ");
+        translate_tokens_pura_to_c(out, vname, vname_len);
+        pura_buf_puts(out, inclusive ? " <= " : " < ");
+        translate_tokens_pura_to_c(out, end_expr, bound_len);
+        pura_buf_puts(out, "; ");
+        translate_tokens_pura_to_c(out, vname, vname_len);
         if (step_pos) {
             const char *sval = step_pos + 6;
             size_t slen = end_len - (size_t)(sval - end_expr);
             while (slen > 0 && sval[0] == ' ') { sval++; slen--; }
-            strata_buf_puts(out, " += ");
-            translate_tokens_strata_to_c(out, sval, slen);
+            pura_buf_puts(out, " += ");
+            translate_tokens_pura_to_c(out, sval, slen);
         } else {
-            strata_buf_puts(out, "++");
+            pura_buf_puts(out, "++");
         }
-        strata_buf_puts(out, ") {");
+        pura_buf_puts(out, ") {");
         return true;
     }
 
     /* C++ range-based for: `for item in container:` -> `for (auto item : container) {` */
-    strata_buf_puts(out, "for (");
+    pura_buf_puts(out, "for (");
     if (vcolon) {
         emit_c_typed_decl(out, vname, vname_len, vtype, vtype_len);
     } else {
-        strata_buf_puts(out, "auto ");
-        translate_tokens_strata_to_c(out, vname, vname_len);
+        pura_buf_puts(out, "auto ");
+        translate_tokens_pura_to_c(out, vname, vname_len);
     }
-    strata_buf_puts(out, " : ");
-    translate_tokens_strata_to_c(out, rhs, rhs_len);
-    strata_buf_puts(out, ") {");
+    pura_buf_puts(out, " : ");
+    translate_tokens_pura_to_c(out, rhs, rhs_len);
+    pura_buf_puts(out, ") {");
     return true;
 }
 
-static void close_block_frame(StrataBuf *out, BlockFrame frame, const char *c_indent) {
+static void close_block_frame(PuraBuf *out, BlockFrame frame, const char *c_indent) {
     if (frame.kind == BLOCK_CASE) {
         return; /* case blocks don't emit a closing '}' in C */
     }
-    strata_buf_indent(out, c_indent, strlen(c_indent), frame.level);
+    pura_buf_indent(out, c_indent, strlen(c_indent), frame.level);
     if (frame.kind == BLOCK_STRUCT_OR_CLASS || frame.kind == BLOCK_ENUM) {
-        strata_buf_puts(out, "};\n");
+        pura_buf_puts(out, "};\n");
     } else {
-        strata_buf_puts(out, "}\n");
+        pura_buf_puts(out, "}\n");
     }
 }
 
-char *strata_to_c(const char *src, size_t len, StrataError *err, size_t *out_len) {
+char *pura_to_c(const char *src, size_t len, PuraError *err, size_t *out_len) {
     if (err) { err->message = NULL; err->line = 0; err->col = 0; }
 
     /* Reject UTF-8 BOM */
@@ -1465,8 +1465,8 @@ char *strata_to_c(const char *src, size_t len, StrataError *err, size_t *out_len
         return NULL;
     }
 
-    StrataBuf out;
-    if (!strata_buf_init(&out, len * 2 + 128)) return NULL;
+    PuraBuf out;
+    if (!pura_buf_init(&out, len * 2 + 128)) return NULL;
 
     symtab_reset();
 
@@ -1505,7 +1505,7 @@ char *strata_to_c(const char *src, size_t len, StrataError *err, size_t *out_len
 
         /* Blank line? */
         if (line_start + ws == line_end) {
-            strata_buf_putc(&out, '\n');
+            pura_buf_putc(&out, '\n');
             continue;
         }
 
@@ -1515,7 +1515,7 @@ char *strata_to_c(const char *src, size_t len, StrataError *err, size_t *out_len
                 err->line = line_no;
                 err->col = ws;
             }
-            strata_buf_free(&out);
+            pura_buf_free(&out);
             return NULL;
         }
 
@@ -1526,7 +1526,7 @@ char *strata_to_c(const char *src, size_t len, StrataError *err, size_t *out_len
                 err->line = line_no;
                 err->col = line_end - line_start;
             }
-            strata_buf_free(&out);
+            pura_buf_free(&out);
             return NULL;
         }
 
@@ -1540,7 +1540,7 @@ char *strata_to_c(const char *src, size_t len, StrataError *err, size_t *out_len
                         err->line = line_no;
                         err->col = 1;
                     }
-                    strata_buf_free(&out);
+                    pura_buf_free(&out);
                     return NULL;
                 }
                 indent_char = ch;
@@ -1553,7 +1553,7 @@ char *strata_to_c(const char *src, size_t len, StrataError *err, size_t *out_len
                         err->line = line_no;
                         err->col = 1;
                     }
-                    strata_buf_free(&out);
+                    pura_buf_free(&out);
                     return NULL;
                 }
                 if (ws % indent_width != 0) {
@@ -1562,7 +1562,7 @@ char *strata_to_c(const char *src, size_t len, StrataError *err, size_t *out_len
                         err->line = line_no;
                         err->col = ws + 1;
                     }
-                    strata_buf_free(&out);
+                    pura_buf_free(&out);
                     return NULL;
                 }
                 level = ws / indent_width;
@@ -1580,7 +1580,7 @@ char *strata_to_c(const char *src, size_t len, StrataError *err, size_t *out_len
                     err->line = prev_block_line;
                     err->col = 1;
                 }
-                strata_buf_free(&out);
+                pura_buf_free(&out);
                 return NULL;
             }
             prev_line_opened_block = false;
@@ -1590,16 +1590,16 @@ char *strata_to_c(const char *src, size_t len, StrataError *err, size_t *out_len
                 err->line = line_no;
                 err->col = ws + 1;
             }
-            strata_buf_free(&out);
+            pura_buf_free(&out);
             return NULL;
         }
 
         /* Full-line comment `# ...` */
         if (content[0] == '#') {
-            strata_buf_indent(&out, c_indent, strlen(c_indent), level);
-            strata_buf_puts(&out, "//");
-            strata_buf_append(&out, content + 1, clen - 1);
-            strata_buf_putc(&out, '\n');
+            pura_buf_indent(&out, c_indent, strlen(c_indent), level);
+            pura_buf_puts(&out, "//");
+            pura_buf_append(&out, content + 1, clen - 1);
+            pura_buf_putc(&out, '\n');
             continue;
         }
 
@@ -1645,32 +1645,32 @@ char *strata_to_c(const char *src, size_t len, StrataError *err, size_t *out_len
         if (sp > 0 && stack[sp - 1].level == level && stack[sp - 1].kind == BLOCK_DO_WHILE &&
             starts_with_kw(content, code_len, "while", &kw_after) && content[code_len - 1] != ':') {
             sp--;
-            strata_buf_indent(&out, c_indent, strlen(c_indent), level);
-            strata_buf_puts(&out, "} while (");
-            translate_tokens_strata_to_c(&out, content + kw_after, code_len - kw_after);
-            strata_buf_puts(&out, ");");
+            pura_buf_indent(&out, c_indent, strlen(c_indent), level);
+            pura_buf_puts(&out, "} while (");
+            translate_tokens_pura_to_c(&out, content + kw_after, code_len - kw_after);
+            pura_buf_puts(&out, ");");
             if (inline_comment) {
-                strata_buf_puts(&out, " //");
-                strata_buf_append(&out, inline_comment + 1, (size_t)(content + clen - (inline_comment + 1)));
+                pura_buf_puts(&out, " //");
+                pura_buf_append(&out, inline_comment + 1, (size_t)(content + clen - (inline_comment + 1)));
             }
-            strata_buf_putc(&out, '\n');
+            pura_buf_putc(&out, '\n');
             continue;
         }
 
         /* Handle `pass` (no-op empty block statement) */
         if (code_len == 4 && memcmp(content, "pass", 4) == 0) {
             if (inline_comment) {
-                strata_buf_indent(&out, c_indent, strlen(c_indent), level);
-                strata_buf_puts(&out, "//");
-                strata_buf_append(&out, inline_comment + 1, (size_t)(content + clen - (inline_comment + 1)));
-                strata_buf_putc(&out, '\n');
+                pura_buf_indent(&out, c_indent, strlen(c_indent), level);
+                pura_buf_puts(&out, "//");
+                pura_buf_append(&out, inline_comment + 1, (size_t)(content + clen - (inline_comment + 1)));
+                pura_buf_putc(&out, '\n');
             }
             continue;
         }
 
         /* Preprocessor & module imports:
          *   - Extensionless (`import math_utils` or `from math_utils import ...`):
-         *     Imports a Strata `.st` module -> `#include "math_utils.h"`
+         *     Imports a Pura `.pu` module -> `#include "math_utils.h"`
          *   - With `.h`/`.c`/`.hpp` extension (`import stdio.h`, `import "my.h"`):
          *     Imports an untranspiled C/C++ header or source file directly (`#include <stdio.h>` or `#include "my.h"`).
          *   - `define NAME val` -> `#define NAME val`
@@ -1679,27 +1679,27 @@ char *strata_to_c(const char *src, size_t len, StrataError *err, size_t *out_len
         if (starts_with_kw(content, code_len, "import", &kw_after)) {
             const char *imp = content + kw_after;
             size_t ilen = code_len - kw_after;
-            strata_buf_puts(&out, "#include ");
+            pura_buf_puts(&out, "#include ");
             if (ilen > 0 && (imp[0] == '<' || imp[0] == '"')) {
-                strata_buf_append(&out, imp, ilen);
+                pura_buf_append(&out, imp, ilen);
             } else if (memchr(imp, '.', ilen) != NULL) {
                 /* Explicit extension (.h, .c, .hpp): untranspiled C/C++ header/file */
-                strata_buf_putc(&out, '<');
-                strata_buf_append(&out, imp, ilen);
-                strata_buf_putc(&out, '>');
+                pura_buf_putc(&out, '<');
+                pura_buf_append(&out, imp, ilen);
+                pura_buf_putc(&out, '>');
             } else {
-                /* Extensionless: Strata .st module (transpiled to local "module.h") */
-                strata_buf_putc(&out, '"');
+                /* Extensionless: Pura .pu module (transpiled to local "module.h") */
+                pura_buf_putc(&out, '"');
                 for (size_t k = 0; k < ilen; k++) {
-                    strata_buf_putc(&out, imp[k]);
+                    pura_buf_putc(&out, imp[k]);
                 }
-                strata_buf_puts(&out, ".h\"");
+                pura_buf_puts(&out, ".h\"");
             }
             if (inline_comment) {
-                strata_buf_puts(&out, " //");
-                strata_buf_append(&out, inline_comment + 1, (size_t)(content + clen - (inline_comment + 1)));
+                pura_buf_puts(&out, " //");
+                pura_buf_append(&out, inline_comment + 1, (size_t)(content + clen - (inline_comment + 1)));
             }
-            strata_buf_putc(&out, '\n');
+            pura_buf_putc(&out, '\n');
             continue;
         }
 
@@ -1709,53 +1709,53 @@ char *strata_to_c(const char *src, size_t len, StrataError *err, size_t *out_len
             /* Extract module up to ` import` */
             size_t mlen = 0;
             while (mlen < flen && f[mlen] != ' ') mlen++;
-            strata_buf_puts(&out, "#include ");
+            pura_buf_puts(&out, "#include ");
             if (mlen > 0 && (f[0] == '<' || f[0] == '"')) {
-                strata_buf_append(&out, f, mlen);
+                pura_buf_append(&out, f, mlen);
             } else if (memchr(f, '.', mlen) != NULL) {
-                strata_buf_putc(&out, '<');
-                strata_buf_append(&out, f, mlen);
-                strata_buf_putc(&out, '>');
+                pura_buf_putc(&out, '<');
+                pura_buf_append(&out, f, mlen);
+                pura_buf_putc(&out, '>');
             } else {
-                strata_buf_putc(&out, '"');
-                strata_buf_append(&out, f, mlen);
-                strata_buf_puts(&out, ".h\"");
+                pura_buf_putc(&out, '"');
+                pura_buf_append(&out, f, mlen);
+                pura_buf_puts(&out, ".h\"");
             }
-            strata_buf_putc(&out, '\n');
+            pura_buf_putc(&out, '\n');
             continue;
         }
 
         if (starts_with_kw(content, code_len, "define", &kw_after)) {
-            strata_buf_puts(&out, "#define ");
-            translate_tokens_strata_to_c(&out, content + kw_after, code_len - kw_after);
+            pura_buf_puts(&out, "#define ");
+            translate_tokens_pura_to_c(&out, content + kw_after, code_len - kw_after);
             if (inline_comment) {
-                strata_buf_puts(&out, " //");
-                strata_buf_append(&out, inline_comment + 1, (size_t)(content + clen - (inline_comment + 1)));
+                pura_buf_puts(&out, " //");
+                pura_buf_append(&out, inline_comment + 1, (size_t)(content + clen - (inline_comment + 1)));
             }
-            strata_buf_putc(&out, '\n');
+            pura_buf_putc(&out, '\n');
             continue;
         }
 
         if (starts_with_kw(content, code_len, "ifdef", &kw_after)) {
-            strata_buf_puts(&out, "#ifdef ");
-            strata_buf_append(&out, content + kw_after, code_len - kw_after);
-            strata_buf_putc(&out, '\n');
+            pura_buf_puts(&out, "#ifdef ");
+            pura_buf_append(&out, content + kw_after, code_len - kw_after);
+            pura_buf_putc(&out, '\n');
             continue;
         }
         if (starts_with_kw(content, code_len, "ifndef", &kw_after)) {
-            strata_buf_puts(&out, "#ifndef ");
-            strata_buf_append(&out, content + kw_after, code_len - kw_after);
-            strata_buf_putc(&out, '\n');
+            pura_buf_puts(&out, "#ifndef ");
+            pura_buf_append(&out, content + kw_after, code_len - kw_after);
+            pura_buf_putc(&out, '\n');
             continue;
         }
         if (code_len == 5 && memcmp(content, "endif", 5) == 0) {
-            strata_buf_puts(&out, "#endif\n");
+            pura_buf_puts(&out, "#endif\n");
             continue;
         }
         if (starts_with_kw(content, code_len, "pragma", &kw_after)) {
-            strata_buf_puts(&out, "#pragma ");
-            strata_buf_append(&out, content + kw_after, code_len - kw_after);
-            strata_buf_putc(&out, '\n');
+            pura_buf_puts(&out, "#pragma ");
+            pura_buf_append(&out, content + kw_after, code_len - kw_after);
+            pura_buf_putc(&out, '\n');
             continue;
         }
 
@@ -1767,64 +1767,64 @@ char *strata_to_c(const char *src, size_t len, StrataError *err, size_t *out_len
 
             /* `elif cond:` or `else:` continuing an open `if` block */
             if (is_elif && sp > 0 && stack[sp - 1].level == level) {
-                strata_buf_indent(&out, c_indent, strlen(c_indent), level);
-                strata_buf_puts(&out, "} else if (");
-                translate_tokens_strata_to_c(&out, content + kw_after, hlen - kw_after);
-                strata_buf_puts(&out, ") {");
+                pura_buf_indent(&out, c_indent, strlen(c_indent), level);
+                pura_buf_puts(&out, "} else if (");
+                translate_tokens_pura_to_c(&out, content + kw_after, hlen - kw_after);
+                pura_buf_puts(&out, ") {");
                 current_level = level + 1;
                 prev_line_opened_block = true;
                 prev_block_line = line_no;
             } else if (is_else && sp > 0 && stack[sp - 1].level == level) {
-                strata_buf_indent(&out, c_indent, strlen(c_indent), level);
-                strata_buf_puts(&out, "} else {");
+                pura_buf_indent(&out, c_indent, strlen(c_indent), level);
+                pura_buf_puts(&out, "} else {");
                 current_level = level + 1;
                 prev_line_opened_block = true;
                 prev_block_line = line_no;
             } else if (is_catch && sp > 0 && stack[sp - 1].level == level) {
-                strata_buf_indent(&out, c_indent, strlen(c_indent), level);
-                strata_buf_puts(&out, "} catch (");
+                pura_buf_indent(&out, c_indent, strlen(c_indent), level);
+                pura_buf_puts(&out, "} catch (");
                 const char *cexpr = content + kw_after;
                 size_t cl = hlen - kw_after;
                 if (cl == 0) {
-                    strata_buf_puts(&out, "...");
+                    pura_buf_puts(&out, "...");
                 } else {
                     emit_c_param_list(&out, cexpr, cl, level + 1);
                 }
-                strata_buf_puts(&out, ") {");
+                pura_buf_puts(&out, ") {");
                 current_level = level + 1;
                 prev_line_opened_block = true;
                 prev_block_line = line_no;
             } else if (starts_with_kw(content, hlen, "if", &kw_after)) {
-                strata_buf_indent(&out, c_indent, strlen(c_indent), level);
-                strata_buf_puts(&out, "if (");
-                translate_tokens_strata_to_c(&out, content + kw_after, hlen - kw_after);
-                strata_buf_puts(&out, ") {");
+                pura_buf_indent(&out, c_indent, strlen(c_indent), level);
+                pura_buf_puts(&out, "if (");
+                translate_tokens_pura_to_c(&out, content + kw_after, hlen - kw_after);
+                pura_buf_puts(&out, ") {");
                 stack[sp++] = (BlockFrame){level, BLOCK_NORMAL};
                 current_level = level + 1;
                 prev_line_opened_block = true;
                 prev_block_line = line_no;
             } else if (starts_with_kw(content, hlen, "while", &kw_after)) {
-                strata_buf_indent(&out, c_indent, strlen(c_indent), level);
-                strata_buf_puts(&out, "while (");
-                translate_tokens_strata_to_c(&out, content + kw_after, hlen - kw_after);
-                strata_buf_puts(&out, ") {");
+                pura_buf_indent(&out, c_indent, strlen(c_indent), level);
+                pura_buf_puts(&out, "while (");
+                translate_tokens_pura_to_c(&out, content + kw_after, hlen - kw_after);
+                pura_buf_puts(&out, ") {");
                 stack[sp++] = (BlockFrame){level, BLOCK_NORMAL};
                 current_level = level + 1;
                 prev_line_opened_block = true;
                 prev_block_line = line_no;
             } else if (hlen == 2 && memcmp(content, "do", 2) == 0) {
-                strata_buf_indent(&out, c_indent, strlen(c_indent), level);
-                strata_buf_puts(&out, "do {");
+                pura_buf_indent(&out, c_indent, strlen(c_indent), level);
+                pura_buf_puts(&out, "do {");
                 stack[sp++] = (BlockFrame){level, BLOCK_DO_WHILE};
                 current_level = level + 1;
                 prev_line_opened_block = true;
                 prev_block_line = line_no;
             } else if (starts_with_kw(content, hlen, "for", &kw_after)) {
-                strata_buf_indent(&out, c_indent, strlen(c_indent), level);
+                pura_buf_indent(&out, c_indent, strlen(c_indent), level);
                 const char *fexpr = content + kw_after;
                 size_t flen = hlen - kw_after;
                 if (!try_emit_for_in(&out, fexpr, flen)) {
-                    strata_buf_puts(&out, "for (");
+                    pura_buf_puts(&out, "for (");
                     const char *semi1 = memchr(fexpr, ';', flen);
                     if (semi1) {
                         size_t init_len = (size_t)(semi1 - fexpr);
@@ -1834,7 +1834,7 @@ char *strata_to_c(const char *src, size_t len, StrataError *err, size_t *out_len
                             size_t nlen = (size_t)(d_col - fexpr);
                             const char *ts = d_col + 1;
                             size_t tlen = d_eq ? (size_t)(d_eq - ts) : (init_len - (size_t)(ts - fexpr));
-                            if (is_strata_ptr_type(ts, tlen)) {
+                            if (is_pura_ptr_type(ts, tlen)) {
                                 symtab_add_ptr_var(fexpr, nlen, level + 1);
                             }
                             emit_c_typed_decl(&out, fexpr, nlen, ts, tlen);
@@ -1842,17 +1842,17 @@ char *strata_to_c(const char *src, size_t len, StrataError *err, size_t *out_len
                                 const char *v = d_eq + 1;
                                 size_t vlen = init_len - (size_t)(v - fexpr);
                                 while (vlen > 0 && v[0] == ' ') { v++; vlen--; }
-                                strata_buf_puts(&out, " = ");
-                                translate_tokens_strata_to_c(&out, v, vlen);
+                                pura_buf_puts(&out, " = ");
+                                translate_tokens_pura_to_c(&out, v, vlen);
                             }
                         } else {
-                            translate_tokens_strata_to_c(&out, fexpr, init_len);
+                            translate_tokens_pura_to_c(&out, fexpr, init_len);
                         }
-                        translate_tokens_strata_to_c(&out, semi1, flen - init_len);
+                        translate_tokens_pura_to_c(&out, semi1, flen - init_len);
                     } else {
-                        translate_tokens_strata_to_c(&out, fexpr, flen);
+                        translate_tokens_pura_to_c(&out, fexpr, flen);
                     }
-                    strata_buf_puts(&out, ") {");
+                    pura_buf_puts(&out, ") {");
                 }
                 stack[sp++] = (BlockFrame){level, BLOCK_NORMAL};
                 current_level = level + 1;
@@ -1860,26 +1860,26 @@ char *strata_to_c(const char *src, size_t len, StrataError *err, size_t *out_len
                 prev_block_line = line_no;
             } else if (starts_with_kw(content, hlen, "switch", &kw_after) ||
                        starts_with_kw(content, hlen, "match", &kw_after)) {
-                strata_buf_indent(&out, c_indent, strlen(c_indent), level);
-                strata_buf_puts(&out, "switch (");
-                translate_tokens_strata_to_c(&out, content + kw_after, hlen - kw_after);
-                strata_buf_puts(&out, ") {");
+                pura_buf_indent(&out, c_indent, strlen(c_indent), level);
+                pura_buf_puts(&out, "switch (");
+                translate_tokens_pura_to_c(&out, content + kw_after, hlen - kw_after);
+                pura_buf_puts(&out, ") {");
                 stack[sp++] = (BlockFrame){level, BLOCK_SWITCH};
                 current_level = level + 1;
                 prev_line_opened_block = true;
                 prev_block_line = line_no;
             } else if (starts_with_kw(content, hlen, "case", &kw_after)) {
-                strata_buf_indent(&out, c_indent, strlen(c_indent), level);
-                strata_buf_puts(&out, "case ");
-                translate_tokens_strata_to_c(&out, content + kw_after, hlen - kw_after);
-                strata_buf_putc(&out, ':');
+                pura_buf_indent(&out, c_indent, strlen(c_indent), level);
+                pura_buf_puts(&out, "case ");
+                translate_tokens_pura_to_c(&out, content + kw_after, hlen - kw_after);
+                pura_buf_putc(&out, ':');
                 stack[sp++] = (BlockFrame){level, BLOCK_CASE};
                 current_level = level + 1;
                 prev_line_opened_block = true;
                 prev_block_line = line_no;
             } else if (hlen == 7 && memcmp(content, "default", 7) == 0) {
-                strata_buf_indent(&out, c_indent, strlen(c_indent), level);
-                strata_buf_puts(&out, "default:");
+                pura_buf_indent(&out, c_indent, strlen(c_indent), level);
+                pura_buf_puts(&out, "default:");
                 stack[sp++] = (BlockFrame){level, BLOCK_CASE};
                 current_level = level + 1;
                 prev_line_opened_block = true;
@@ -1888,9 +1888,9 @@ char *strata_to_c(const char *src, size_t len, StrataError *err, size_t *out_len
                        (hlen == 7 && memcmp(content, "private", 7) == 0) ||
                        (hlen == 9 && memcmp(content, "protected", 9) == 0)) {
                 /* C++ access specifiers inside class/struct */
-                strata_buf_indent(&out, c_indent, strlen(c_indent), level > 0 ? level - 1 : 0);
-                strata_buf_append(&out, content, hlen);
-                strata_buf_puts(&out, ":\n");
+                pura_buf_indent(&out, c_indent, strlen(c_indent), level > 0 ? level - 1 : 0);
+                pura_buf_append(&out, content, hlen);
+                pura_buf_puts(&out, ":\n");
                 continue;
             } else if (starts_with_kw(content, hlen, "struct", &kw_after) ||
                        starts_with_kw(content, hlen, "class", &kw_after) ||
@@ -1904,18 +1904,18 @@ char *strata_to_c(const char *src, size_t len, StrataError *err, size_t *out_len
                     while (tlen > 0 && content[kw_after + tlen - 1] == ' ') tlen--;
                     symtab_add_tag("union", content + kw_after, tlen);
                 }
-                strata_buf_indent(&out, c_indent, strlen(c_indent), level);
+                pura_buf_indent(&out, c_indent, strlen(c_indent), level);
                 /* Check for inheritance `class Dog(Animal)` -> `class Dog : public Animal` */
                 const char *lp = memchr(content, '(', hlen);
                 const char *rp = lp ? memchr(lp, ')', hlen - (size_t)(lp - content)) : NULL;
                 if (lp && rp) {
-                    translate_tokens_strata_to_c(&out, content, (size_t)(lp - content));
-                    strata_buf_puts(&out, " : public ");
-                    translate_tokens_strata_to_c(&out, lp + 1, (size_t)(rp - lp - 1));
-                    strata_buf_puts(&out, " {");
+                    translate_tokens_pura_to_c(&out, content, (size_t)(lp - content));
+                    pura_buf_puts(&out, " : public ");
+                    translate_tokens_pura_to_c(&out, lp + 1, (size_t)(rp - lp - 1));
+                    pura_buf_puts(&out, " {");
                 } else {
-                    translate_tokens_strata_to_c(&out, content, hlen);
-                    strata_buf_puts(&out, " {");
+                    translate_tokens_pura_to_c(&out, content, hlen);
+                    pura_buf_puts(&out, " {");
                 }
                 stack[sp++] = (BlockFrame){level, BLOCK_STRUCT_OR_CLASS};
                 current_level = level + 1;
@@ -1925,34 +1925,34 @@ char *strata_to_c(const char *src, size_t len, StrataError *err, size_t *out_len
                 size_t tlen = hlen - kw_after;
                 while (tlen > 0 && content[kw_after + tlen - 1] == ' ') tlen--;
                 symtab_add_tag("enum", content + kw_after, tlen);
-                strata_buf_indent(&out, c_indent, strlen(c_indent), level);
-                translate_tokens_strata_to_c(&out, content, hlen);
-                strata_buf_puts(&out, " {");
+                pura_buf_indent(&out, c_indent, strlen(c_indent), level);
+                translate_tokens_pura_to_c(&out, content, hlen);
+                pura_buf_puts(&out, " {");
                 stack[sp++] = (BlockFrame){level, BLOCK_ENUM};
                 current_level = level + 1;
                 prev_line_opened_block = true;
                 prev_block_line = line_no;
             } else if (starts_with_kw(content, hlen, "namespace", &kw_after)) {
-                strata_buf_indent(&out, c_indent, strlen(c_indent), level);
-                translate_tokens_strata_to_c(&out, content, hlen);
-                strata_buf_puts(&out, " {");
+                pura_buf_indent(&out, c_indent, strlen(c_indent), level);
+                translate_tokens_pura_to_c(&out, content, hlen);
+                pura_buf_puts(&out, " {");
                 stack[sp++] = (BlockFrame){level, BLOCK_NORMAL};
                 current_level = level + 1;
                 prev_line_opened_block = true;
                 prev_block_line = line_no;
             } else if (hlen == 3 && memcmp(content, "try", 3) == 0) {
-                strata_buf_indent(&out, c_indent, strlen(c_indent), level);
-                strata_buf_puts(&out, "try {");
+                pura_buf_indent(&out, c_indent, strlen(c_indent), level);
+                pura_buf_puts(&out, "try {");
                 stack[sp++] = (BlockFrame){level, BLOCK_NORMAL};
                 current_level = level + 1;
                 prev_line_opened_block = true;
                 prev_block_line = line_no;
             } else if (starts_with_kw(content, hlen, "def", &kw_after) ||
                        starts_with_kw(content, hlen, "fn", &kw_after)) {
-                strata_buf_indent(&out, c_indent, strlen(c_indent), level);
-                if (!emit_strata_function_def(&out, NULL, content + kw_after, hlen - kw_after, true, level + 1)) {
+                pura_buf_indent(&out, c_indent, strlen(c_indent), level);
+                if (!emit_pura_function_def(&out, NULL, content + kw_after, hlen - kw_after, true, level + 1)) {
                     if (err) { err->message = "invalid function definition"; err->line = line_no; err->col = 1; }
-                    strata_buf_free(&out);
+                    pura_buf_free(&out);
                     return NULL;
                 }
                 stack[sp++] = (BlockFrame){level, BLOCK_NORMAL};
@@ -1963,7 +1963,7 @@ char *strata_to_c(const char *src, size_t len, StrataError *err, size_t *out_len
                        starts_with_kw(content, hlen, "static def", &kw_after) ||
                        starts_with_kw(content, hlen, "inline def", &kw_after) ||
                        starts_with_kw(content, hlen, "virtual def", &kw_after)) {
-                strata_buf_indent(&out, c_indent, strlen(c_indent), level);
+                pura_buf_indent(&out, c_indent, strlen(c_indent), level);
                 char qual[32];
                 /* Copy everything before ` def` */
                 size_t qlen = kw_after;
@@ -1973,9 +1973,9 @@ char *strata_to_c(const char *src, size_t len, StrataError *err, size_t *out_len
                 }
                 memcpy(qual, content, qlen);
                 qual[qlen] = '\0';
-                if (!emit_strata_function_def(&out, qual, content + kw_after, hlen - kw_after, true, level + 1)) {
+                if (!emit_pura_function_def(&out, qual, content + kw_after, hlen - kw_after, true, level + 1)) {
                     if (err) { err->message = "invalid qualified function definition"; err->line = line_no; err->col = 1; }
-                    strata_buf_free(&out);
+                    pura_buf_free(&out);
                     return NULL;
                 }
                 stack[sp++] = (BlockFrame){level, BLOCK_NORMAL};
@@ -1984,9 +1984,9 @@ char *strata_to_c(const char *src, size_t len, StrataError *err, size_t *out_len
                 prev_block_line = line_no;
             } else {
                 /* Generic C/C++ block header ending in `:` */
-                strata_buf_indent(&out, c_indent, strlen(c_indent), level);
-                translate_tokens_strata_to_c(&out, content, hlen);
-                strata_buf_puts(&out, " {");
+                pura_buf_indent(&out, c_indent, strlen(c_indent), level);
+                translate_tokens_pura_to_c(&out, content, hlen);
+                pura_buf_puts(&out, " {");
                 stack[sp++] = (BlockFrame){level, BLOCK_NORMAL};
                 current_level = level + 1;
                 prev_line_opened_block = true;
@@ -1994,43 +1994,43 @@ char *strata_to_c(const char *src, size_t len, StrataError *err, size_t *out_len
             }
 
             if (inline_comment) {
-                strata_buf_puts(&out, " //");
-                strata_buf_append(&out, inline_comment + 1, (size_t)(content + clen - (inline_comment + 1)));
+                pura_buf_puts(&out, " //");
+                pura_buf_append(&out, inline_comment + 1, (size_t)(content + clen - (inline_comment + 1)));
             }
-            strata_buf_putc(&out, '\n');
+            pura_buf_putc(&out, '\n');
             continue;
         }
 
         /* Non-block statement at `level` */
-        strata_buf_indent(&out, c_indent, strlen(c_indent), level);
+        pura_buf_indent(&out, c_indent, strlen(c_indent), level);
 
         /* Inside an `enum` block, entries are comma-separated rather than semicolon-terminated */
         if (sp > 0 && stack[sp - 1].kind == BLOCK_ENUM && stack[sp - 1].level + 1 == level) {
-            translate_tokens_strata_to_c(&out, content, code_len);
+            translate_tokens_pura_to_c(&out, content, code_len);
             if (code_len > 0 && content[code_len - 1] != ',') {
-                strata_buf_putc(&out, ',');
+                pura_buf_putc(&out, ',');
             }
             if (inline_comment) {
-                strata_buf_puts(&out, " //");
-                strata_buf_append(&out, inline_comment + 1, (size_t)(content + clen - (inline_comment + 1)));
+                pura_buf_puts(&out, " //");
+                pura_buf_append(&out, inline_comment + 1, (size_t)(content + clen - (inline_comment + 1)));
             }
-            strata_buf_putc(&out, '\n');
+            pura_buf_putc(&out, '\n');
             continue;
         }
 
         /* Function prototype without body: `def foo(a: i32) -> i32` */
         if (starts_with_kw(content, code_len, "def", &kw_after) ||
             starts_with_kw(content, code_len, "fn", &kw_after)) {
-            if (!emit_strata_function_def(&out, NULL, content + kw_after, code_len - kw_after, false, level + 1)) {
+            if (!emit_pura_function_def(&out, NULL, content + kw_after, code_len - kw_after, false, level + 1)) {
                 if (err) { err->message = "invalid function prototype"; err->line = line_no; err->col = 1; }
-                strata_buf_free(&out);
+                pura_buf_free(&out);
                 return NULL;
             }
             if (inline_comment) {
-                strata_buf_puts(&out, " //");
-                strata_buf_append(&out, inline_comment + 1, (size_t)(content + clen - (inline_comment + 1)));
+                pura_buf_puts(&out, " //");
+                pura_buf_append(&out, inline_comment + 1, (size_t)(content + clen - (inline_comment + 1)));
             }
-            strata_buf_putc(&out, '\n');
+            pura_buf_putc(&out, '\n');
             continue;
         }
 
@@ -2045,14 +2045,14 @@ char *strata_to_c(const char *src, size_t len, StrataError *err, size_t *out_len
                 const char *target = eq + 1;
                 size_t tlen = rlen - (size_t)(target - rest);
                 while (tlen > 0 && target[0] == ' ') { target++; tlen--; }
-                strata_buf_puts(&out, "typedef ");
+                pura_buf_puts(&out, "typedef ");
                 emit_c_typed_decl(&out, rest, alias_len, target, tlen);
-                strata_buf_putc(&out, ';');
+                pura_buf_putc(&out, ';');
                 if (inline_comment) {
-                    strata_buf_puts(&out, " //");
-                    strata_buf_append(&out, inline_comment + 1, (size_t)(content + clen - (inline_comment + 1)));
+                    pura_buf_puts(&out, " //");
+                    pura_buf_append(&out, inline_comment + 1, (size_t)(content + clen - (inline_comment + 1)));
                 }
-                strata_buf_putc(&out, '\n');
+                pura_buf_putc(&out, '\n');
                 continue;
             }
         }
@@ -2072,15 +2072,15 @@ char *strata_to_c(const char *src, size_t len, StrataError *err, size_t *out_len
             }
             if (last_space) {
                 size_t qlen = (size_t)(last_space - lhs);
-                strata_buf_append(&out, lhs, qlen);
-                strata_buf_putc(&out, ' ');
+                pura_buf_append(&out, lhs, qlen);
+                pura_buf_putc(&out, ' ');
                 lhs = last_space + 1;
                 lhs_len -= (qlen + 1);
             }
 
             const char *ts = decl_colon + 1;
             size_t tlen = decl_eq ? (size_t)(decl_eq - ts) : (code_len - (size_t)(ts - content));
-            if (is_strata_ptr_type(ts, tlen) &&
+            if (is_pura_ptr_type(ts, tlen) &&
                 !(sp > 0 && stack[sp - 1].kind == BLOCK_STRUCT_OR_CLASS && stack[sp - 1].level + 1 == level)) {
                 symtab_add_ptr_var(lhs, lhs_len, level);
             }
@@ -2090,28 +2090,28 @@ char *strata_to_c(const char *src, size_t len, StrataError *err, size_t *out_len
                 const char *val = decl_eq + 1;
                 size_t vlen = code_len - (size_t)(val - content);
                 while (vlen > 0 && val[0] == ' ') { val++; vlen--; }
-                strata_buf_puts(&out, " = ");
-                translate_tokens_strata_to_c(&out, val, vlen);
+                pura_buf_puts(&out, " = ");
+                translate_tokens_pura_to_c(&out, val, vlen);
             }
-            strata_buf_putc(&out, ';');
-        } else if (level == 0 && try_emit_strata_macro_define(&out, content, code_len)) {
+            pura_buf_putc(&out, ';');
+        } else if (level == 0 && try_emit_pura_macro_define(&out, content, code_len)) {
             /* Root-level Pythonic constant/macro assignment:
              *   `MAX_SIZE = 1024`         -> `#define MAX_SIZE 1024`
              *   `MIN(a, b) = ((a) < (b))` -> `#define MIN(a, b) ((a) < (b))`
              */
         } else {
             /* Standard expression / statement */
-            translate_tokens_strata_to_c(&out, content, code_len);
+            translate_tokens_pura_to_c(&out, content, code_len);
             if (code_len > 0 && content[code_len - 1] != ';' && content[code_len - 1] != ',') {
-                strata_buf_putc(&out, ';');
+                pura_buf_putc(&out, ';');
             }
         }
 
         if (inline_comment) {
-            strata_buf_puts(&out, " //");
-            strata_buf_append(&out, inline_comment + 1, (size_t)(content + clen - (inline_comment + 1)));
+            pura_buf_puts(&out, " //");
+            pura_buf_append(&out, inline_comment + 1, (size_t)(content + clen - (inline_comment + 1)));
         }
-        strata_buf_putc(&out, '\n');
+        pura_buf_putc(&out, '\n');
     }
 
     if (prev_line_opened_block) {
@@ -2120,7 +2120,7 @@ char *strata_to_c(const char *src, size_t len, StrataError *err, size_t *out_len
             err->line = prev_block_line;
             err->col = 1;
         }
-        strata_buf_free(&out);
+        pura_buf_free(&out);
         return NULL;
     }
 
@@ -2134,7 +2134,7 @@ char *strata_to_c(const char *src, size_t len, StrataError *err, size_t *out_len
 }
 
 /* -------------------------------------------------------------------------
- * C/C++ -> Strata Transpiler & Canonical Strata Formatter
+ * C/C++ -> Pura Transpiler & Canonical Pura Formatter
  * ------------------------------------------------------------------------- */
 
 static bool valid_indent_unit(const char *unit, size_t *out_len) {
@@ -2150,13 +2150,13 @@ static bool valid_indent_unit(const char *unit, size_t *out_len) {
     return true;
 }
 
-/* Try to parse a C parameter `const char* name` or `int32_t arr[10]` into Strata `name: cstr` */
-static void emit_strata_param(StrataBuf *out, const char *p, size_t len) {
+/* Try to parse a C parameter `const char* name` or `int32_t arr[10]` into Pura `name: cstr` */
+static void emit_pura_param(PuraBuf *out, const char *p, size_t len) {
     while (len > 0 && p[0] == ' ') { p++; len--; }
     while (len > 0 && p[len - 1] == ' ') len--;
     if (len == 0 || (len == 4 && memcmp(p, "void", 4) == 0)) return;
     if (len == 3 && memcmp(p, "...", 3) == 0) {
-        strata_buf_puts(out, "...");
+        pura_buf_puts(out, "...");
         return;
     }
 
@@ -2171,7 +2171,7 @@ static void emit_strata_param(StrataBuf *out, const char *p, size_t len) {
     while (id_start > 0 && is_ident_cont(p[id_start - 1])) id_start--;
 
     if (id_start == 0 || id_start == id_end) {
-        translate_tokens_c_to_strata(out, p, len);
+        translate_tokens_c_to_pura(out, p, len);
         return;
     }
 
@@ -2183,16 +2183,16 @@ static void emit_strata_param(StrataBuf *out, const char *p, size_t len) {
         type_end++;
     }
 
-    strata_buf_append(out, p + id_start, id_end - id_start);
-    strata_buf_puts(out, ": ");
-    translate_type_c_to_strata(out, p, type_end);
+    pura_buf_append(out, p + id_start, id_end - id_start);
+    pura_buf_puts(out, ": ");
+    translate_type_c_to_pura(out, p, type_end);
     if (bracket) {
-        translate_tokens_c_to_strata(out, bracket, len - (size_t)(bracket - p));
+        translate_tokens_c_to_pura(out, bracket, len - (size_t)(bracket - p));
     }
 }
 
 /* Try to convert a C function header `ret_type func_name(params)` into `def func_name(params) -> ret_type:` */
-static bool try_emit_c_func_to_strata(StrataBuf *out, const char *s, size_t len, bool is_block) {
+static bool try_emit_c_func_to_pura(PuraBuf *out, const char *s, size_t len, bool is_block) {
     /* Exclude control statements */
     size_t dummy = 0;
     if (starts_with_kw(s, len, "if", &dummy) ||
@@ -2238,22 +2238,22 @@ static bool try_emit_c_func_to_strata(StrataBuf *out, const char *s, size_t len,
     /* Check for leading `static inline `, `static `, or `inline ` */
     const char *ret_start = s;
     if (ret_end > 14 && memcmp(s, "static inline ", 14) == 0) {
-        strata_buf_puts(out, "static inline ");
+        pura_buf_puts(out, "static inline ");
         ret_start += 14;
         ret_end -= 14;
     } else if (ret_end > 7 && memcmp(s, "static ", 7) == 0) {
-        strata_buf_puts(out, "static ");
+        pura_buf_puts(out, "static ");
         ret_start += 7;
         ret_end -= 7;
     } else if (ret_end > 7 && memcmp(s, "inline ", 7) == 0) {
-        strata_buf_puts(out, "inline ");
+        pura_buf_puts(out, "inline ");
         ret_start += 7;
         ret_end -= 7;
     }
 
-    strata_buf_puts(out, "def ");
-    strata_buf_append(out, s + fn_start, pre_len - fn_start);
-    strata_buf_putc(out, '(');
+    pura_buf_puts(out, "def ");
+    pura_buf_append(out, s + fn_start, pre_len - fn_start);
+    pura_buf_putc(out, '(');
 
     /* Parse comma-separated parameters */
     const char *params = lparen + 1;
@@ -2277,31 +2277,31 @@ static bool try_emit_c_func_to_strata(StrataBuf *out, const char *s, size_t len,
         while (item_len > 0 && item[item_len - 1] == ' ') item_len--;
         if (item_len == 0 || (item_len == 4 && memcmp(item, "void", 4) == 0)) continue;
 
-        if (!first) strata_buf_puts(out, ", ");
+        if (!first) pura_buf_puts(out, ", ");
         first = false;
-        emit_strata_param(out, item, item_len);
+        emit_pura_param(out, item, item_len);
     }
-    strata_buf_putc(out, ')');
+    pura_buf_putc(out, ')');
 
     /* Trailing `const` after rparen? */
     const char *after_rp = rparen + 1;
     size_t after_len = len - (size_t)(after_rp - s);
     while (after_len > 0 && after_rp[0] == ' ') { after_rp++; after_len--; }
     if (after_len >= 5 && memcmp(after_rp, "const", 5) == 0) {
-        strata_buf_puts(out, " const");
+        pura_buf_puts(out, " const");
     }
 
     /* Emit `-> ret_type` unless void */
     if (!(ret_end == 4 && memcmp(ret_start, "void", 4) == 0)) {
-        strata_buf_puts(out, " -> ");
-        translate_type_c_to_strata(out, ret_start, ret_end);
+        pura_buf_puts(out, " -> ");
+        translate_type_c_to_pura(out, ret_start, ret_end);
     }
-    if (is_block) strata_buf_putc(out, ':');
+    if (is_block) pura_buf_putc(out, ':');
     return true;
 }
 
 /* Try to convert a simple C variable declaration `int32_t x = 10` or `const char* msg = "hi"` to `x: i32 = 10` */
-static bool try_emit_c_var_decl_to_strata(StrataBuf *out, const char *s, size_t len) {
+static bool try_emit_c_var_decl_to_pura(PuraBuf *out, const char *s, size_t len) {
     size_t dummy = 0;
     if (starts_with_kw(s, len, "return", &dummy) ||
         starts_with_kw(s, len, "break", &dummy) ||
@@ -2386,27 +2386,27 @@ static bool try_emit_c_var_decl_to_strata(StrataBuf *out, const char *s, size_t 
     }
 
     if (qual) {
-        strata_buf_append(out, qual, qual_len);
-        strata_buf_putc(out, ' ');
+        pura_buf_append(out, qual, qual_len);
+        pura_buf_putc(out, ' ');
     }
-    strata_buf_append(out, lhs + name_start, name_end - name_start);
-    strata_buf_puts(out, ": ");
-    translate_type_c_to_strata(out, lhs, type_end);
+    pura_buf_append(out, lhs + name_start, name_end - name_start);
+    pura_buf_puts(out, ": ");
+    translate_type_c_to_pura(out, lhs, type_end);
     if (bracket) {
-        translate_tokens_c_to_strata(out, bracket, lhs_len - (size_t)(bracket - lhs));
+        translate_tokens_c_to_pura(out, bracket, lhs_len - (size_t)(bracket - lhs));
     }
     if (eq) {
         const char *rhs = eq + 1;
         size_t rhs_len = len - (size_t)(rhs - s);
         while (rhs_len > 0 && rhs[0] == ' ') { rhs++; rhs_len--; }
-        strata_buf_puts(out, " = ");
-        translate_tokens_c_to_strata(out, rhs, rhs_len);
+        pura_buf_puts(out, " = ");
+        translate_tokens_c_to_pura(out, rhs, rhs_len);
     }
     return true;
 }
 
 /* Try to convert a C 3-clause `for (T i = start; i < stop; i++)` into Pythonic `for i in range(...)` */
-static bool try_emit_c_for_range_to_strata(StrataBuf *out, const char *init_s, size_t init_len,
+static bool try_emit_c_for_range_to_pura(PuraBuf *out, const char *init_s, size_t init_len,
                                            const char *cond_s, size_t cond_len,
                                            const char *step_s, size_t step_len) {
     while (init_len > 0 && init_s[0] == ' ') { init_s++; init_len--; }
@@ -2496,33 +2496,33 @@ static bool try_emit_c_for_range_to_strata(StrataBuf *out, const char *init_s, s
     }
 
     /* Emit `vname` (and `: type` if not default `int` / `int32_t`) */
-    strata_buf_append(out, vname, vlen);
+    pura_buf_append(out, vname, vlen);
     bool is_default_i32 = (type_len == 3 && memcmp(init_s, "int", 3) == 0) ||
                           (type_len == 7 && memcmp(init_s, "int32_t", 7) == 0);
     if (!is_default_i32) {
-        strata_buf_puts(out, ": ");
-        translate_type_c_to_strata(out, init_s, type_len);
+        pura_buf_puts(out, ": ");
+        translate_type_c_to_pura(out, init_s, type_len);
     }
-    strata_buf_puts(out, " in range(");
+    pura_buf_puts(out, " in range(");
     bool start_is_zero = (start_len == 1 && start_s[0] == '0');
     if (start_is_zero && !custom_step) {
-        translate_tokens_c_to_strata(out, stop_s, stop_len);
+        translate_tokens_c_to_pura(out, stop_s, stop_len);
     } else {
-        translate_tokens_c_to_strata(out, start_s, start_len);
-        strata_buf_puts(out, ", ");
-        translate_tokens_c_to_strata(out, stop_s, stop_len);
+        translate_tokens_c_to_pura(out, start_s, start_len);
+        pura_buf_puts(out, ", ");
+        translate_tokens_c_to_pura(out, stop_s, stop_len);
         if (custom_step) {
-            strata_buf_puts(out, ", ");
-            if (neg_step && custom_step[0] != '-') strata_buf_putc(out, '-');
-            translate_tokens_c_to_strata(out, custom_step, custom_step_len);
+            pura_buf_puts(out, ", ");
+            if (neg_step && custom_step[0] != '-') pura_buf_putc(out, '-');
+            translate_tokens_c_to_pura(out, custom_step, custom_step_len);
         }
     }
-    strata_buf_putc(out, ')');
+    pura_buf_putc(out, ')');
     return true;
 }
 
-char *strata_from_c_indent(const char *src, size_t len, const char *indent_unit,
-                           StrataError *err, size_t *out_len) {
+char *pura_from_c_indent(const char *src, size_t len, const char *indent_unit,
+                           PuraError *err, size_t *out_len) {
     if (err) { err->message = NULL; err->line = 0; err->col = 0; }
     const char *unit = indent_unit ? indent_unit : "    ";
     size_t unit_len = 0;
@@ -2531,8 +2531,8 @@ char *strata_from_c_indent(const char *src, size_t len, const char *indent_unit,
         return NULL;
     }
 
-    StrataBuf out;
-    if (!strata_buf_init(&out, len + 128)) return NULL;
+    PuraBuf out;
+    if (!pura_buf_init(&out, len + 128)) return NULL;
 
     symtab_reset();
 
@@ -2555,7 +2555,7 @@ char *strata_from_c_indent(const char *src, size_t len, const char *indent_unit,
         while (le > ls && (src[le - 1] == ' ' || src[le - 1] == '\t')) le--;
 
         if (ls == le) {
-            strata_buf_putc(&out, '\n');
+            pura_buf_putc(&out, '\n');
             continue;
         }
 
@@ -2565,10 +2565,10 @@ char *strata_from_c_indent(const char *src, size_t len, const char *indent_unit,
         /* Single-line comment `// ...` -> `# ...` */
         if (llen >= 2 && line[0] == '/' && line[1] == '/') {
             size_t eff_depth = depth + (in_case_body ? 1 : 0);
-            strata_buf_indent(&out, unit, unit_len, eff_depth);
-            strata_buf_putc(&out, '#');
-            strata_buf_append(&out, line + 2, llen - 2);
-            strata_buf_putc(&out, '\n');
+            pura_buf_indent(&out, unit, unit_len, eff_depth);
+            pura_buf_putc(&out, '#');
+            pura_buf_append(&out, line + 2, llen - 2);
+            pura_buf_putc(&out, '\n');
             continue;
         }
 
@@ -2581,18 +2581,18 @@ char *strata_from_c_indent(const char *src, size_t len, const char *indent_unit,
             if (starts_with_kw(d, dlen, "include", &kw_after)) {
                 const char *inc = d + kw_after;
                 size_t ilen = dlen - kw_after;
-                strata_buf_puts(&out, "import ");
+                pura_buf_puts(&out, "import ");
                 if (ilen >= 2 && inc[0] == '<' && inc[ilen - 1] == '>') {
                     /* `#include <stdio.h>` -> `import stdio.h` */
-                    strata_buf_append(&out, inc + 1, ilen - 2);
+                    pura_buf_append(&out, inc + 1, ilen - 2);
                 } else if (ilen > 4 && inc[0] == '"' && inc[ilen - 1] == '"' &&
                            memcmp(inc + ilen - 3, ".h\"", 3) == 0) {
-                    /* `#include "math_utils.h"` -> `import math_utils` (Strata .st module) */
-                    strata_buf_append(&out, inc + 1, ilen - 4);
+                    /* `#include "math_utils.h"` -> `import math_utils` (Pura .pu module) */
+                    pura_buf_append(&out, inc + 1, ilen - 4);
                 } else {
-                    strata_buf_append(&out, inc, ilen);
+                    pura_buf_append(&out, inc, ilen);
                 }
-                strata_buf_putc(&out, '\n');
+                pura_buf_putc(&out, '\n');
                 continue;
             }
             if (starts_with_kw(d, dlen, "define", &kw_after)) {
@@ -2618,37 +2618,37 @@ char *strata_from_c_indent(const char *src, size_t len, const char *indent_unit,
                 while (i < mlen && m[i] == ' ') i++;
                 if (sig_len > 0 && i < mlen) {
                     /* `#define NAME value` -> `NAME = value` */
-                    strata_buf_append(&out, m, sig_len);
-                    strata_buf_puts(&out, " = ");
-                    translate_tokens_c_to_strata(&out, m + i, mlen - i);
+                    pura_buf_append(&out, m, sig_len);
+                    pura_buf_puts(&out, " = ");
+                    translate_tokens_c_to_pura(&out, m + i, mlen - i);
                 } else {
                     /* Valueless `#define FLAG` -> `define FLAG` */
-                    strata_buf_puts(&out, "define ");
-                    translate_tokens_c_to_strata(&out, m, mlen);
+                    pura_buf_puts(&out, "define ");
+                    translate_tokens_c_to_pura(&out, m, mlen);
                 }
-                strata_buf_putc(&out, '\n');
+                pura_buf_putc(&out, '\n');
                 continue;
             }
             if (starts_with_kw(d, dlen, "ifdef", &kw_after)) {
-                strata_buf_puts(&out, "ifdef ");
-                strata_buf_append(&out, d + kw_after, dlen - kw_after);
-                strata_buf_putc(&out, '\n');
+                pura_buf_puts(&out, "ifdef ");
+                pura_buf_append(&out, d + kw_after, dlen - kw_after);
+                pura_buf_putc(&out, '\n');
                 continue;
             }
             if (starts_with_kw(d, dlen, "ifndef", &kw_after)) {
-                strata_buf_puts(&out, "ifndef ");
-                strata_buf_append(&out, d + kw_after, dlen - kw_after);
-                strata_buf_putc(&out, '\n');
+                pura_buf_puts(&out, "ifndef ");
+                pura_buf_append(&out, d + kw_after, dlen - kw_after);
+                pura_buf_putc(&out, '\n');
                 continue;
             }
             if (starts_with_kw(d, dlen, "endif", &kw_after)) {
-                strata_buf_puts(&out, "endif\n");
+                pura_buf_puts(&out, "endif\n");
                 continue;
             }
             if (starts_with_kw(d, dlen, "pragma", &kw_after)) {
-                strata_buf_puts(&out, "pragma ");
-                strata_buf_append(&out, d + kw_after, dlen - kw_after);
-                strata_buf_putc(&out, '\n');
+                pura_buf_puts(&out, "pragma ");
+                pura_buf_append(&out, d + kw_after, dlen - kw_after);
+                pura_buf_putc(&out, '\n');
                 continue;
             }
         }
@@ -2695,13 +2695,13 @@ char *strata_from_c_indent(const char *src, size_t len, const char *indent_unit,
         if (starts_with_kw(line, code_len, "case", &kw_after) ||
             (code_len == 8 && memcmp(line, "default:", 8) == 0)) {
             in_case_body = false;
-            strata_buf_indent(&out, unit, unit_len, depth);
-            translate_tokens_c_to_strata(&out, line, code_len);
+            pura_buf_indent(&out, unit, unit_len, depth);
+            translate_tokens_c_to_pura(&out, line, code_len);
             if (inline_comment) {
-                strata_buf_puts(&out, " #");
-                strata_buf_append(&out, inline_comment, (size_t)(line + llen - inline_comment));
+                pura_buf_puts(&out, " #");
+                pura_buf_append(&out, inline_comment, (size_t)(line + llen - inline_comment));
             }
-            strata_buf_putc(&out, '\n');
+            pura_buf_putc(&out, '\n');
             in_case_body = true;
             case_switch_depth = depth;
             continue;
@@ -2714,7 +2714,7 @@ char *strata_from_c_indent(const char *src, size_t len, const char *indent_unit,
             size_t hlen = code_len - 1;
             while (hlen > 0 && line[hlen - 1] == ' ') hlen--;
 
-            strata_buf_indent(&out, unit, unit_len, eff_depth);
+            pura_buf_indent(&out, unit, unit_len, eff_depth);
 
             if (starts_with_kw(line, hlen, "else if", &kw_after)) {
                 const char *cond = line + kw_after;
@@ -2723,11 +2723,11 @@ char *strata_from_c_indent(const char *src, size_t len, const char *indent_unit,
                     cond++;
                     clen -= 2;
                 }
-                strata_buf_puts(&out, "elif ");
-                translate_tokens_c_to_strata(&out, cond, clen);
-                strata_buf_putc(&out, ':');
+                pura_buf_puts(&out, "elif ");
+                translate_tokens_c_to_pura(&out, cond, clen);
+                pura_buf_putc(&out, ':');
             } else if (hlen == 4 && memcmp(line, "else", 4) == 0) {
-                strata_buf_puts(&out, "else:");
+                pura_buf_puts(&out, "else:");
             } else if (starts_with_kw(line, hlen, "if", &kw_after)) {
                 const char *cond = line + kw_after;
                 size_t clen = hlen - kw_after;
@@ -2735,9 +2735,9 @@ char *strata_from_c_indent(const char *src, size_t len, const char *indent_unit,
                     cond++;
                     clen -= 2;
                 }
-                strata_buf_puts(&out, "if ");
-                translate_tokens_c_to_strata(&out, cond, clen);
-                strata_buf_putc(&out, ':');
+                pura_buf_puts(&out, "if ");
+                translate_tokens_c_to_pura(&out, cond, clen);
+                pura_buf_putc(&out, ':');
             } else if (starts_with_kw(line, hlen, "while", &kw_after)) {
                 const char *cond = line + kw_after;
                 size_t clen = hlen - kw_after;
@@ -2745,9 +2745,9 @@ char *strata_from_c_indent(const char *src, size_t len, const char *indent_unit,
                     cond++;
                     clen -= 2;
                 }
-                strata_buf_puts(&out, "while ");
-                translate_tokens_c_to_strata(&out, cond, clen);
-                strata_buf_putc(&out, ':');
+                pura_buf_puts(&out, "while ");
+                translate_tokens_c_to_pura(&out, cond, clen);
+                pura_buf_putc(&out, ':');
             } else if (starts_with_kw(line, hlen, "for", &kw_after)) {
                 const char *cond = line + kw_after;
                 size_t clen = hlen - kw_after;
@@ -2755,7 +2755,7 @@ char *strata_from_c_indent(const char *src, size_t len, const char *indent_unit,
                     cond++;
                     clen -= 2;
                 }
-                strata_buf_puts(&out, "for ");
+                pura_buf_puts(&out, "for ");
                 /* Split 3-clause C for `init; cond; step` */
                 const char *semi1 = memchr(cond, ';', clen);
                 const char *semi2 = semi1 ? memchr(semi1 + 1, ';', clen - (size_t)(semi1 + 1 - cond)) : NULL;
@@ -2765,21 +2765,21 @@ char *strata_from_c_indent(const char *src, size_t len, const char *indent_unit,
                     size_t c2_len = (size_t)(semi2 - c2);
                     const char *c3 = semi2 + 1;
                     size_t c3_len = clen - (size_t)(c3 - cond);
-                    if (!try_emit_c_for_range_to_strata(&out, cond, init_len, c2, c2_len, c3, c3_len)) {
-                        if (!try_emit_c_var_decl_to_strata(&out, cond, init_len)) {
-                            translate_tokens_c_to_strata(&out, cond, init_len);
+                    if (!try_emit_c_for_range_to_pura(&out, cond, init_len, c2, c2_len, c3, c3_len)) {
+                        if (!try_emit_c_var_decl_to_pura(&out, cond, init_len)) {
+                            translate_tokens_c_to_pura(&out, cond, init_len);
                         }
-                        strata_buf_puts(&out, "; ");
+                        pura_buf_puts(&out, "; ");
                         while (c2_len > 0 && *c2 == ' ') { c2++; c2_len--; }
-                        translate_tokens_c_to_strata(&out, c2, c2_len);
-                        strata_buf_puts(&out, "; ");
+                        translate_tokens_c_to_pura(&out, c2, c2_len);
+                        pura_buf_puts(&out, "; ");
                         while (c3_len > 0 && *c3 == ' ') { c3++; c3_len--; }
-                        translate_tokens_c_to_strata(&out, c3, c3_len);
+                        translate_tokens_c_to_pura(&out, c3, c3_len);
                     }
                 } else {
-                    translate_tokens_c_to_strata(&out, cond, clen);
+                    translate_tokens_c_to_pura(&out, cond, clen);
                 }
-                strata_buf_putc(&out, ':');
+                pura_buf_putc(&out, ':');
             } else if (starts_with_kw(line, hlen, "switch", &kw_after)) {
                 const char *cond = line + kw_after;
                 size_t clen = hlen - kw_after;
@@ -2787,10 +2787,10 @@ char *strata_from_c_indent(const char *src, size_t len, const char *indent_unit,
                     cond++;
                     clen -= 2;
                 }
-                strata_buf_puts(&out, "switch ");
-                translate_tokens_c_to_strata(&out, cond, clen);
-                strata_buf_putc(&out, ':');
-            } else if (!try_emit_c_func_to_strata(&out, line, hlen, true)) {
+                pura_buf_puts(&out, "switch ");
+                translate_tokens_c_to_pura(&out, cond, clen);
+                pura_buf_putc(&out, ':');
+            } else if (!try_emit_c_func_to_pura(&out, line, hlen, true)) {
                 size_t tag_after = 0;
                 if (starts_with_kw(line, hlen, "struct", &tag_after)) {
                     size_t tlen = hlen - tag_after;
@@ -2805,15 +2805,15 @@ char *strata_from_c_indent(const char *src, size_t len, const char *indent_unit,
                     while (tlen > 0 && line[tag_after + tlen - 1] == ' ') tlen--;
                     symtab_add_tag("union", line + tag_after, tlen);
                 }
-                translate_tokens_c_to_strata(&out, line, hlen);
-                strata_buf_putc(&out, ':');
+                translate_tokens_c_to_pura(&out, line, hlen);
+                pura_buf_putc(&out, ':');
             }
 
             if (inline_comment) {
-                strata_buf_puts(&out, " #");
-                strata_buf_append(&out, inline_comment, (size_t)(line + llen - inline_comment));
+                pura_buf_puts(&out, " #");
+                pura_buf_append(&out, inline_comment, (size_t)(line + llen - inline_comment));
             }
-            strata_buf_putc(&out, '\n');
+            pura_buf_putc(&out, '\n');
             depth++;
             continue;
         }
@@ -2824,7 +2824,7 @@ char *strata_from_c_indent(const char *src, size_t len, const char *indent_unit,
             while (code_len > 0 && line[code_len - 1] == ' ') code_len--;
         }
 
-        strata_buf_indent(&out, unit, unit_len, eff_depth);
+        pura_buf_indent(&out, unit, unit_len, eff_depth);
 
         /* `typedef Target Alias` -> `type Alias = Target` */
         if (starts_with_kw(line, code_len, "typedef", &kw_after)) {
@@ -2836,35 +2836,35 @@ char *strata_from_c_indent(const char *src, size_t len, const char *indent_unit,
             if (id_start > 0 && id_start < id_end) {
                 size_t tend = id_start;
                 while (tend > 0 && rest[tend - 1] == ' ') tend--;
-                strata_buf_puts(&out, "type ");
-                strata_buf_append(&out, rest + id_start, id_end - id_start);
-                strata_buf_puts(&out, " = ");
-                translate_tokens_c_to_strata(&out, rest, tend);
+                pura_buf_puts(&out, "type ");
+                pura_buf_append(&out, rest + id_start, id_end - id_start);
+                pura_buf_puts(&out, " = ");
+                translate_tokens_c_to_pura(&out, rest, tend);
             } else {
-                translate_tokens_c_to_strata(&out, line, code_len);
+                translate_tokens_c_to_pura(&out, line, code_len);
             }
-        } else if (!try_emit_c_func_to_strata(&out, line, code_len, false) &&
-                   !try_emit_c_var_decl_to_strata(&out, line, code_len)) {
-            translate_tokens_c_to_strata(&out, line, code_len);
+        } else if (!try_emit_c_func_to_pura(&out, line, code_len, false) &&
+                   !try_emit_c_var_decl_to_pura(&out, line, code_len)) {
+            translate_tokens_c_to_pura(&out, line, code_len);
         }
 
         if (inline_comment) {
-            strata_buf_puts(&out, " #");
-            strata_buf_append(&out, inline_comment, (size_t)(line + llen - inline_comment));
+            pura_buf_puts(&out, " #");
+            pura_buf_append(&out, inline_comment, (size_t)(line + llen - inline_comment));
         }
-        strata_buf_putc(&out, '\n');
+        pura_buf_putc(&out, '\n');
     }
 
     if (out_len) *out_len = out.len;
     return out.data;
 }
 
-char *strata_format_indent(const char *src, size_t len, const char *indent_unit,
-                           StrataError *err, size_t *out_len) {
+char *pura_format_indent(const char *src, size_t len, const char *indent_unit,
+                           PuraError *err, size_t *out_len) {
     size_t c_len = 0;
-    char *c_code = strata_to_c(src, len, err, &c_len);
+    char *c_code = pura_to_c(src, len, err, &c_len);
     if (!c_code) return NULL;
-    char *st_code = strata_from_c_indent(c_code, c_len, indent_unit, err, out_len);
+    char *st_code = pura_from_c_indent(c_code, c_len, indent_unit, err, out_len);
     free(c_code);
     return st_code;
 }
@@ -2872,7 +2872,7 @@ char *strata_format_indent(const char *src, size_t len, const char *indent_unit,
 /* -------------------------------------------------------------------------
  * Standalone CLI, Conformance Tests, and Head-to-Head Benchmark
  * ------------------------------------------------------------------------- */
-#ifndef STRATA_NO_MAIN
+#ifndef PURA_NO_MAIN
 
 static char *read_file_all(const char *path, size_t *out_len) {
     FILE *fp = fopen(path, "rb");
@@ -2908,7 +2908,7 @@ static double monotonic_sec(void) {
 }
 
 static int run_tests(void) {
-    const char *strata_cases[] = {
+    const char *pura_cases[] = {
         "import stdio.h\n"
         "import stdint.h\n"
         "import math_utils\n"
@@ -2960,30 +2960,30 @@ static int run_tests(void) {
     };
 
     const char *indents[] = {"  ", "    ", "\t"};
-    size_t num_cases = sizeof(strata_cases) / sizeof(strata_cases[0]);
+    size_t num_cases = sizeof(pura_cases) / sizeof(pura_cases[0]);
     size_t num_indents = sizeof(indents) / sizeof(indents[0]);
     size_t passed = 0;
 
     for (size_t i = 0; i < num_cases; i++) {
         for (size_t u = 0; u < num_indents; u++) {
-            StrataError err;
+            PuraError err;
             size_t c1_len = 0;
-            char *c1 = strata_to_c(strata_cases[i], strlen(strata_cases[i]), &err, &c1_len);
+            char *c1 = pura_to_c(pura_cases[i], strlen(pura_cases[i]), &err, &c1_len);
             if (!c1) {
-                fprintf(stderr, "FAIL [case %zu strata_to_c]: %s (line %zu)\n", i, err.message, err.line);
+                fprintf(stderr, "FAIL [case %zu pura_to_c]: %s (line %zu)\n", i, err.message, err.line);
                 return 1;
             }
             size_t st_len = 0;
-            char *st = strata_from_c_indent(c1, c1_len, indents[u], &err, &st_len);
+            char *st = pura_from_c_indent(c1, c1_len, indents[u], &err, &st_len);
             if (!st) {
-                fprintf(stderr, "FAIL [case %zu strata_from_c]: %s\n", i, err.message);
+                fprintf(stderr, "FAIL [case %zu pura_from_c]: %s\n", i, err.message);
                 free(c1);
                 return 1;
             }
             size_t c2_len = 0;
-            char *c2 = strata_to_c(st, st_len, &err, &c2_len);
+            char *c2 = pura_to_c(st, st_len, &err, &c2_len);
             if (!c2) {
-                fprintf(stderr, "FAIL [case %zu roundtrip strata_to_c]: %s (line %zu)\n", i, err.message, err.line);
+                fprintf(stderr, "FAIL [case %zu roundtrip pura_to_c]: %s (line %zu)\n", i, err.message, err.line);
                 free(c1);
                 free(st);
                 return 1;
@@ -3006,8 +3006,8 @@ static int run_tests(void) {
     /* Universal newlines test (\r\n and \r) */
     {
         const char *crlf_src = "def add(a: i32, b: i32) -> i32:\r\n    return a + b\r";
-        StrataError err;
-        char *c_out = strata_to_c(crlf_src, strlen(crlf_src), &err, NULL);
+        PuraError err;
+        char *c_out = pura_to_c(crlf_src, strlen(crlf_src), &err, NULL);
         if (!c_out) {
             fprintf(stderr, "FAIL [universal_newlines]: %s\n", err.message);
             return 1;
@@ -3034,8 +3034,8 @@ static int run_tests(void) {
     };
     size_t num_invalid = sizeof(invalid_cases) / sizeof(invalid_cases[0]);
     for (size_t i = 0; i < num_invalid; i++) {
-        StrataError err;
-        char *c_out = strata_to_c(invalid_cases[i], strlen(invalid_cases[i]), &err, NULL);
+        PuraError err;
+        char *c_out = pura_to_c(invalid_cases[i], strlen(invalid_cases[i]), &err, NULL);
         if (c_out != NULL) {
             fprintf(stderr, "FAIL [invalid %zu accepted]: %s\n", i, invalid_cases[i]);
             free(c_out);
@@ -3044,7 +3044,7 @@ static int run_tests(void) {
         passed++;
     }
 
-    printf("C Strata: all %zu conformance tests passed.\n", passed);
+    printf("C Pura: all %zu conformance tests passed.\n", passed);
     return 0;
 }
 
@@ -3055,13 +3055,13 @@ static int run_bench(const char *path) {
     if (path) {
         st4_sample = read_file_all(path, &st4_len);
         if (!st4_sample) {
-            fprintf(stderr, "strata error: cannot read '%s'\n", path);
+            fprintf(stderr, "pura error: cannot read '%s'\n", path);
             return 1;
         }
     } else {
-        StrataBuf b;
-        strata_buf_init(&b, 65536);
-        strata_buf_puts(&b,
+        PuraBuf b;
+        pura_buf_init(&b, 65536);
+        pura_buf_puts(&b,
             "import stdint.h\n"
             "import stdbool.h\n"
             "import stddef.h\n\n"
@@ -3086,28 +3086,28 @@ static int run_bench(const char *path) {
                 "    return acc\n\n",
                 i, i
             );
-            strata_buf_append(&b, fn, (size_t)n);
+            pura_buf_append(&b, fn, (size_t)n);
         }
         st4_sample = b.data;
         st4_len = b.len;
     }
 
-    StrataError err;
+    PuraError err;
     size_t c_len = 0;
-    char *c_sample = strata_to_c(st4_sample, st4_len, &err, &c_len);
+    char *c_sample = pura_to_c(st4_sample, st4_len, &err, &c_len);
     if (!c_sample) {
-        fprintf(stderr, "strata bench error: %s (line %zu)\n", err.message, err.line);
+        fprintf(stderr, "pura bench error: %s (line %zu)\n", err.message, err.line);
         free(st4_sample);
         return 1;
     }
     size_t st_tab_len = 0;
-    char *st_tab_sample = strata_from_c_indent(c_sample, c_len, "\t", &err, &st_tab_len);
+    char *st_tab_sample = pura_from_c_indent(c_sample, c_len, "\t", &err, &st_tab_len);
 
     int iters = 1000;
     double t0 = monotonic_sec();
     for (int i = 0; i < iters; i++) {
         size_t out_l = 0;
-        char *r = strata_to_c(st4_sample, st4_len, &err, &out_l);
+        char *r = pura_to_c(st4_sample, st4_len, &err, &out_l);
         free(r);
     }
     double dt_st4 = monotonic_sec() - t0;
@@ -3115,7 +3115,7 @@ static int run_bench(const char *path) {
     t0 = monotonic_sec();
     for (int i = 0; i < iters; i++) {
         size_t out_l = 0;
-        char *r = strata_to_c(st_tab_sample, st_tab_len, &err, &out_l);
+        char *r = pura_to_c(st_tab_sample, st_tab_len, &err, &out_l);
         free(r);
     }
     double dt_tab = monotonic_sec() - t0;
@@ -3123,7 +3123,7 @@ static int run_bench(const char *path) {
     t0 = monotonic_sec();
     for (int i = 0; i < iters; i++) {
         size_t out_l = 0;
-        char *r = strata_from_c_indent(c_sample, c_len, "    ", &err, &out_l);
+        char *r = pura_from_c_indent(c_sample, c_len, "    ", &err, &out_l);
         free(r);
     }
     double dt_from_c = monotonic_sec() - t0;
@@ -3132,15 +3132,15 @@ static int run_bench(const char *path) {
     double mib_tab = ((double)st_tab_len * iters / (1024.0 * 1024.0)) / dt_tab;
     double mib_from_c = ((double)c_len * iters / (1024.0 * 1024.0)) / dt_from_c;
 
-    printf("Strata Benchmark (250 functions, %d iterations):\n", iters);
+    printf("Pura Benchmark (250 functions, %d iterations):\n", iters);
     printf("  C source size          : %zu bytes (%.1f KiB)\n", c_len, (double)c_len / 1024.0);
-    printf("  Strata 4-space size    : %zu bytes (%.1f KiB, %+.1f%% vs C)\n",
+    printf("  Pura 4-space size    : %zu bytes (%.1f KiB, %+.1f%% vs C)\n",
            st4_len, (double)st4_len / 1024.0, 100.0 * ((double)st4_len - (double)c_len) / (double)c_len);
-    printf("  Strata tab (\\t) size   : %zu bytes (%.1f KiB, %+.1f%% vs C)\n",
+    printf("  Pura tab (\\t) size   : %zu bytes (%.1f KiB, %+.1f%% vs C)\n",
            st_tab_len, (double)st_tab_len / 1024.0, 100.0 * ((double)st_tab_len - (double)c_len) / (double)c_len);
-    printf("  Strata (4-sp) -> C     : %.0f files/s (%.1f MiB/s)\n", (double)iters / dt_st4, mib_st4);
-    printf("  Strata (tab)  -> C     : %.0f files/s (%.1f MiB/s)\n", (double)iters / dt_tab, mib_tab);
-    printf("  C -> Strata (4-sp)     : %.0f files/s (%.1f MiB/s)\n", (double)iters / dt_from_c, mib_from_c);
+    printf("  Pura (4-sp) -> C     : %.0f files/s (%.1f MiB/s)\n", (double)iters / dt_st4, mib_st4);
+    printf("  Pura (tab)  -> C     : %.0f files/s (%.1f MiB/s)\n", (double)iters / dt_tab, mib_tab);
+    printf("  C -> Pura (4-sp)     : %.0f files/s (%.1f MiB/s)\n", (double)iters / dt_from_c, mib_from_c);
 
     free(st4_sample);
     free(c_sample);
@@ -3151,14 +3151,14 @@ static int run_bench(const char *path) {
 static void print_usage(const char *prog) {
     fprintf(stderr,
         "Usage:\n"
-        "  %s <file.st>                         Transpile Strata to C/C++ on stdout\n"
-        "  %s --strata [--indent <N|tab>] <f>   Format/canonicalize Strata\n"
-        "  %s --from-c [--indent <N|tab>] <f>   Convert C/C++ source to Strata\n"
-        "  %s --compile <file.st> [-o <bin>]    Transpile and compile via cc/c++\n"
-        "  %s --run <file.st>                   Transpile, compile, and execute immediately\n"
-        "  %s --check <file.st>                 Validate Strata syntax only\n"
+        "  %s <file.pu>                         Transpile Pura to C/C++ on stdout\n"
+        "  %s --pura [--indent <N|tab>] <f>   Format/canonicalize Pura\n"
+        "  %s --from-c [--indent <N|tab>] <f>   Convert C/C++ source to Pura\n"
+        "  %s --compile <file.pu> [-o <bin>]    Transpile and compile via cc/c++\n"
+        "  %s --run <file.pu>                   Transpile, compile, and execute immediately\n"
+        "  %s --check <file.pu>                 Validate Pura syntax only\n"
         "  %s --test                            Run built-in conformance test suite\n"
-        "  %s --bench [file.st]                 Run transpilation throughput benchmark\n",
+        "  %s --bench [file.pu]                 Run transpilation throughput benchmark\n",
         prog, prog, prog, prog, prog, prog, prog, prog
     );
 }
@@ -3169,7 +3169,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    bool mode_strata = false;
+    bool mode_pura = false;
     bool mode_from_c = false;
     bool mode_check = false;
     bool mode_compile = false;
@@ -3185,8 +3185,8 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--bench") == 0) {
             const char *bpath = (i + 1 < argc && argv[i + 1][0] != '-') ? argv[i + 1] : NULL;
             return run_bench(bpath);
-        } else if (strcmp(argv[i], "--strata") == 0) {
-            mode_strata = true;
+        } else if (strcmp(argv[i], "--pura") == 0) {
+            mode_pura = true;
         } else if (strcmp(argv[i], "--from-c") == 0) {
             mode_from_c = true;
         } else if (strcmp(argv[i], "--check") == 0) {
@@ -3204,7 +3204,7 @@ int main(int argc, char **argv) {
             } else {
                 int n = atoi(arg);
                 if (n <= 0 || n >= (int)sizeof(custom_spaces)) {
-                    fprintf(stderr, "strata error: --indent must be 1..63 or 'tab'\n");
+                    fprintf(stderr, "pura error: --indent must be 1..63 or 'tab'\n");
                     return 1;
                 }
                 memset(custom_spaces, ' ', (size_t)n);
@@ -3217,30 +3217,30 @@ int main(int argc, char **argv) {
         } else if (argv[i][0] != '-') {
             input_path = argv[i];
         } else {
-            fprintf(stderr, "strata error: unknown option '%s'\n", argv[i]);
+            fprintf(stderr, "pura error: unknown option '%s'\n", argv[i]);
             return 1;
         }
     }
 
     if (!input_path) {
-        fprintf(stderr, "strata error: missing input file\n");
+        fprintf(stderr, "pura error: missing input file\n");
         return 1;
     }
 
     size_t src_len = 0;
     char *src = read_file_all(input_path, &src_len);
     if (!src) {
-        fprintf(stderr, "strata error: cannot read '%s'\n", input_path);
+        fprintf(stderr, "pura error: cannot read '%s'\n", input_path);
         return 1;
     }
 
-    StrataError err;
+    PuraError err;
     if (mode_from_c) {
         size_t out_len = 0;
-        char *st = strata_from_c_indent(src, src_len, indent_opt, &err, &out_len);
+        char *st = pura_from_c_indent(src, src_len, indent_opt, &err, &out_len);
         free(src);
         if (!st) {
-            fprintf(stderr, "strata error:%zu:%zu: %s\n", err.line, err.col, err.message);
+            fprintf(stderr, "pura error:%zu:%zu: %s\n", err.line, err.col, err.message);
             return 1;
         }
         fwrite(st, 1, out_len, stdout);
@@ -3248,12 +3248,12 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    if (mode_strata) {
+    if (mode_pura) {
         size_t out_len = 0;
-        char *st = strata_format_indent(src, src_len, indent_opt, &err, &out_len);
+        char *st = pura_format_indent(src, src_len, indent_opt, &err, &out_len);
         free(src);
         if (!st) {
-            fprintf(stderr, "strata error:%zu:%zu: %s\n", err.line, err.col, err.message);
+            fprintf(stderr, "pura error:%zu:%zu: %s\n", err.line, err.col, err.message);
             return 1;
         }
         fwrite(st, 1, out_len, stdout);
@@ -3262,10 +3262,10 @@ int main(int argc, char **argv) {
     }
 
     size_t c_len = 0;
-    char *c_code = strata_to_c(src, src_len, &err, &c_len);
+    char *c_code = pura_to_c(src, src_len, &err, &c_len);
     free(src);
     if (!c_code) {
-        fprintf(stderr, "strata error:%zu:%zu: %s\n", err.line, err.col, err.message);
+        fprintf(stderr, "pura error:%zu:%zu: %s\n", err.line, err.col, err.message);
         return 1;
     }
 
@@ -3276,10 +3276,10 @@ int main(int argc, char **argv) {
 
     if (mode_compile || mode_run) {
         char tmp_c[256];
-        snprintf(tmp_c, sizeof(tmp_c), "/tmp/strata_%d.c", (int)getpid());
+        snprintf(tmp_c, sizeof(tmp_c), "/tmp/pura_%d.c", (int)getpid());
         FILE *fp = fopen(tmp_c, "wb");
         if (!fp) {
-            fprintf(stderr, "strata error: failed to create temporary C file\n");
+            fprintf(stderr, "pura error: failed to create temporary C file\n");
             free(c_code);
             return 1;
         }
@@ -3291,7 +3291,7 @@ int main(int argc, char **argv) {
         if (output_bin) {
             snprintf(bin_path, sizeof(bin_path), "%s", output_bin);
         } else if (mode_run) {
-            snprintf(bin_path, sizeof(bin_path), "/tmp/strata_bin_%d", (int)getpid());
+            snprintf(bin_path, sizeof(bin_path), "/tmp/pura_bin_%d", (int)getpid());
         } else {
             snprintf(bin_path, sizeof(bin_path), "a.out");
         }
@@ -3314,4 +3314,4 @@ int main(int argc, char **argv) {
     free(c_code);
     return 0;
 }
-#endif /* STRATA_NO_MAIN */
+#endif /* PURA_NO_MAIN */

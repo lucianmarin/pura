@@ -1,4 +1,4 @@
-# Structs, enums, pointers, and switch/case in Strata
+# Structs, enums, pointers, and switch/case in Pura
 import stdio.h
 import stdint.h
 import stdbool.h
