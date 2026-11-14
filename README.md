@@ -7,7 +7,6 @@ Just as **LMON is JSON and JSON is LMON**, **Pura is C/C++ and C/C++ is Pura**. 
 - **Extension:** `.pu` (or `.pura`)
 - **Target Languages:** ISO C11 / C17 / C23 and ISO C++17 / C++20
 - **Encoding:** UTF-8 (without BOM)
-- **Version:** 1.0
 
 ---
 
@@ -119,7 +118,7 @@ int32_t main(void) {
 
 ---
 
-## Pura 1.0 Specification
+## Pura Specification
 
 ### 1. Encoding, Universal Newlines, and Auto-Detected Indentation
 
