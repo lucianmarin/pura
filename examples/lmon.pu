@@ -1,0 +1,2121 @@
+# LMON (Light Machine / Lucian Marin Object Notation) — Pura implementation
+#
+# Features:
+#   - Flat contiguous value-array DOM (zero pointer-to-pointer indirection)
+#   - Zero-copy string & key slicing with ARM NEON SIMD / fast ASCII scanning
+#   - Auto-detected indentation (any number of spaces or tabs) & universal newlines (\n, \r\n, \r)
+#   - Complete LMON parser, canonical serializer, and RFC 8259 JSON converter
+#   - Embeddable as a library (define LMON_NO_MAIN before compiling)
+#
+# Build & CLI usage with Pura:
+#   ./pura --compile examples/lmon.pu -o lmon_pu
+#   ./lmon_pu --test
+#   ./lmon_pu --bench
+
+import ctype.h
+import errno.h
+import inttypes.h
+import math.h
+import stdbool.h
+import stddef.h
+import stdint.h
+import stdio.h
+import stdlib.h
+import string.h
+import time.h
+
+ifdef __ARM_NEON
+import arm_neon.h
+endif
+
+# -------------------------------------------------------------------------
+# Public Flat-DOM Types & Arena Allocator
+# -------------------------------------------------------------------------
+
+enum LmonType:
+    LMON_NULL = 0
+    LMON_BOOL = 1
+    LMON_INT = 2
+    LMON_FLOAT = 3
+    LMON_STRING = 4
+    LMON_ARRAY = 5
+    LMON_OBJECT = 6
+
+struct LmonStr:
+    ptr: cstr
+    len: usize
+
+struct LmonValue
+struct LmonMember
+
+struct LmonArray:
+    items: addr[LmonValue]
+    len: usize
+
+struct LmonObject:
+    members: addr[LmonMember]
+    len: usize
+
+union LmonPayload:
+    b: bool
+    i: i64
+    f: f64
+    s: LmonStr
+    arr: LmonArray
+    obj: LmonObject
+
+struct LmonValue:
+    type: LmonType
+    u: LmonPayload
+
+struct LmonMember:
+    key: LmonStr
+    val: LmonValue
+
+struct LmonArenaBlock:
+    next: addr[LmonArenaBlock]
+    cap: usize
+    used: usize
+    data: u8[]
+
+struct LmonArena:
+    head: addr[LmonArenaBlock]
+    default_block_size: usize
+
+struct LmonError:
+    message: cstr
+    pos: usize
+    line: usize
+    col: usize
+
+static def lmon_arena_init(arena: addr[LmonArena], hint_bytes: usize):
+    arena.head = nil
+    if hint_bytes < 4096:
+        arena.default_block_size = 4096
+    else:
+        arena.default_block_size = hint_bytes
+
+static def lmon_arena_reset(arena: addr[LmonArena]):
+    if arena.head == nil:
+        return
+    keep: addr[LmonArenaBlock] = arena.head
+    blk: addr[LmonArenaBlock] = keep.next
+    while blk != nil:
+        next: addr[LmonArenaBlock] = blk.next
+        free(blk)
+        blk = next
+    keep.next = nil
+    keep.used = 0
+
+static def lmon_arena_free(arena: addr[LmonArena]):
+    blk: addr[LmonArenaBlock] = arena.head
+    while blk != nil:
+        next: addr[LmonArenaBlock] = blk.next
+        free(blk)
+        blk = next
+    arena.head = nil
+
+static inline def lmon_arena_alloc(arena: addr[LmonArena], size: usize) -> any:
+    aligned: usize = (size + 7) & ~usize(7)
+    blk: addr[LmonArenaBlock] = arena.head
+    if blk == nil or blk.cap - blk.used < aligned:
+        cap: usize = arena.default_block_size
+        if aligned > cap:
+            cap = aligned
+        blk = cast(addr[LmonArenaBlock], malloc(sizeof(LmonArenaBlock) + cap))
+        if blk == nil:
+            return nil
+        blk.cap = cap
+        blk.used = 0
+        blk.next = arena.head
+        arena.head = blk
+    ptr: any = blk.data + blk.used
+    blk.used += aligned
+    return ptr
+
+# Growable byte buffer for serialization
+struct LmonBuf:
+    data: str
+    len: usize
+    cap: usize
+
+static def lmon_buf_init(b: addr[LmonBuf], initial_cap: usize) -> bool:
+    if initial_cap < 256:
+        b.cap = 256
+    else:
+        b.cap = initial_cap
+    b.data = cast(str, malloc(b.cap))
+    b.len = 0
+    if b.data != nil:
+        b.data[0] = '\0'
+    return b.data != nil
+
+static def lmon_buf_reserve(b: addr[LmonBuf], extra: usize) -> bool:
+    if b.cap - b.len >= extra:
+        return true
+    new_cap: usize = b.cap * 2
+    while new_cap - b.len < extra:
+        new_cap *= 2
+    p: str = cast(str, realloc(b.data, new_cap))
+    if p == nil:
+        return false
+    b.data = p
+    b.cap = new_cap
+    return true
+
+static def lmon_buf_append(b: addr[LmonBuf], s: cstr, n: usize):
+    if not lmon_buf_reserve(b, n + 1):
+        return
+    memcpy(b.data + b.len, s, n)
+    b.len += n
+    b.data[b.len] = '\0'
+
+static def lmon_buf_putc(b: addr[LmonBuf], c: char):
+    if not lmon_buf_reserve(b, 2):
+        return
+    b.data[b.len++] = c
+    b.data[b.len] = '\0'
+
+static def lmon_buf_spaces(b: addr[LmonBuf], spaces: usize):
+    if not lmon_buf_reserve(b, spaces + 1):
+        return
+    memset(b.data + b.len, ' ', spaces)
+    b.len += spaces
+    b.data[b.len] = '\0'
+
+static def lmon_buf_repeat_unit(b: addr[LmonBuf], unit: cstr, unit_len: usize, depth: usize):
+    if depth == 0 or unit_len == 0:
+        return
+    total: usize = unit_len * depth
+    if not lmon_buf_reserve(b, total + 1):
+        return
+    if unit_len == 1:
+        memset(b.data + b.len, u8(unit[0]), total)
+        b.len += total
+    elif unit[0] == ' ':
+        memset(b.data + b.len, ' ', total)
+        b.len += total
+    else:
+        for i: usize in range(depth):
+            memcpy(b.data + b.len, unit, unit_len)
+            b.len += unit_len
+    b.data[b.len] = '\0'
+
+# -------------------------------------------------------------------------
+# Character & UTF-8 Helpers
+# -------------------------------------------------------------------------
+
+# 1 = [A-Za-z_], 2 = [0-9-]
+static inline def lmon_key_class(c: u8) -> u8:
+    if (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or c == '_':
+        return 1
+    if (c >= '0' and c <= '9') or c == '-':
+        return 2
+    return 0
+
+static inline def lmon_is_reserved_key(s: cstr, len: usize) -> bool:
+    if len == 4:
+        return (s[0] == 't' and memcmp(s, "true", 4) == 0) or (s[0] == 'n' and memcmp(s, "null", 4) == 0)
+    if len == 5:
+        return s[0] == 'f' and memcmp(s, "false", 5) == 0
+    return false
+
+# Validate one non-ASCII UTF-8 sequence starting at val(pp) and advance val(pp)
+static inline def lmon_step_utf8_non_ascii(pp: addr[cstr], end: cstr) -> bool:
+    p: addr[const u8] = cast(addr[const u8], val(pp))
+    uend: addr[const u8] = cast(addr[const u8], end)
+    c: u8 = val(p)
+    if (c & 0xE0) == 0xC0:
+        if c < 0xC2 or uend - p < 2 or (p[1] & 0xC0) != 0x80:
+            return false
+        val(pp) += 2
+        return true
+    if (c & 0xF0) == 0xE0:
+        if uend - p < 3 or (p[1] & 0xC0) != 0x80 or (p[2] & 0xC0) != 0x80:
+            return false
+        if c == 0xE0 and p[1] < 0xA0:
+            return false
+        if c == 0xED and p[1] >= 0xA0:
+            return false # UTF-16 surrogates forbidden
+        val(pp) += 3
+        return true
+    if (c & 0xF8) == 0xF0:
+        if c > 0xF4 or uend - p < 4 or (p[1] & 0xC0) != 0x80 or (p[2] & 0xC0) != 0x80 or (p[3] & 0xC0) != 0x80:
+            return false
+        if c == 0xF0 and p[1] < 0x90:
+            return false
+        if c == 0xF4 and p[1] >= 0x90:
+            return false
+        val(pp) += 4
+        return true
+    return false
+
+static inline def hex_val(c: u8) -> i32:
+    if c >= '0' and c <= '9':
+        return i32(c - '0')
+    if c >= 'a' and c <= 'f':
+        return i32(c - 'a' + 10)
+    if c >= 'A' and c <= 'F':
+        return i32(c - 'A' + 10)
+    return -1
+
+static inline def encode_utf8(cp: u32, out: str) -> usize:
+    if cp <= 0x7F:
+        out[0] = char(cp)
+        return 1
+    elif cp <= 0x7FF:
+        out[0] = char(0xC0 | (cp >> 6))
+        out[1] = char(0x80 | (cp & 0x3F))
+        return 2
+    elif cp <= 0xFFFF:
+        out[0] = char(0xE0 | (cp >> 12))
+        out[1] = char(0x80 | ((cp >> 6) & 0x3F))
+        out[2] = char(0x80 | (cp & 0x3F))
+        return 3
+    else:
+        out[0] = char(0xF0 | (cp >> 18))
+        out[1] = char(0x80 | ((cp >> 12) & 0x3F))
+        out[2] = char(0x80 | ((cp >> 6) & 0x3F))
+        out[3] = char(0x80 | (cp & 0x3F))
+        return 4
+
+# -------------------------------------------------------------------------
+# Single-Pass LMON Parser (Auto-Indent + Universal Newlines + Flat DOM)
+# -------------------------------------------------------------------------
+
+struct LmonParser:
+    src: cstr
+    end: cstr
+    p: cstr
+    line_start: cstr
+    line_indent: i32
+    indent_char: char
+    indent_width: i32
+    indent_shift: i32
+    arena: addr[LmonArena]
+    err: addr[LmonError]
+
+static inline def lmon_pow2_shift(w: usize) -> i32:
+    if w == 0 or (w & (w - 1)) != 0:
+        return -1
+    s: i32 = 0
+    while (w >> s) > 1:
+        s++
+    return s
+
+static def lmon_set_error(ps: addr[LmonParser], msg: cstr, at: cstr):
+    err: addr[LmonError] = ps.err
+    if err == nil or err.message != nil:
+        return
+    pos: usize = usize(at - ps.src)
+    line: usize = 1
+    col: usize = 1
+    for i: usize = 0; i < pos; i++:
+        c: char = ps.src[i]
+        if c == '\n':
+            line++
+            col = 1
+        elif c == '\r':
+            line++
+            col = 1
+            if i + 1 < pos and ps.src[i + 1] == '\n':
+                i++
+        elif (u8(c) & 0xC0) != 0x80:
+            col++
+    err.message = msg
+    err.pos = pos
+    err.line = line
+    err.col = col
+
+static inline def lmon_compute_indent_level(ps: addr[LmonParser], line_begin: cstr, p: cstr, first: u8) -> i32:
+    count: usize = usize(p - line_begin)
+    level: i32 = 0
+    if ps.indent_char == char(first):
+        if ps.indent_shift >= 0:
+            if (count & (usize(ps.indent_width) - 1)) != 0:
+                lmon_set_error(ps, "indentation is not a multiple of detected indent width", line_begin)
+                return -3
+            level = i32(count >> ps.indent_shift)
+        else:
+            w: usize = usize(ps.indent_width)
+            q: usize = count / w
+            if q * w != count:
+                lmon_set_error(ps, "indentation is not a multiple of detected indent width", line_begin)
+                return -3
+            level = i32(q)
+    elif ps.indent_char == 0:
+        ps.indent_char = char(first)
+        ps.indent_width = i32(count)
+        ps.indent_shift = lmon_pow2_shift(count)
+        level = 1
+    else:
+        if first == ' ':
+            lmon_set_error(ps, "inconsistent indentation: document uses tabs, got spaces", line_begin)
+        else:
+            lmon_set_error(ps, "inconsistent indentation: document uses spaces, got tab", line_begin)
+        return -3
+
+    ps.p = p
+    ps.line_start = line_begin
+    ps.line_indent = level
+    return level
+
+static inline def lmon_peek_line(ps: addr[LmonParser]) -> i32:
+    if ps.line_indent != -2:
+        return ps.line_indent
+
+    p: cstr = ps.p
+    end: cstr = ps.end
+
+    while p < end:
+        line_begin: cstr = p
+        first: u8 = u8(val(p))
+
+        if first == ' ':
+            while end - p >= 8:
+                w8: u64 = 0
+                memcpy(w8.addr, p, 8)
+                if w8 != 0x2020202020202020ULL:
+                    break
+                p += 8
+            while end - p >= 4:
+                w4: u32 = 0
+                memcpy(w4.addr, p, 4)
+                if w4 != 0x20202020u:
+                    break
+                p += 4
+            while p < end and val(p) == ' ':
+                p++
+
+            if p >= end:
+                ps.p = p
+                ps.line_indent = -1
+                return -1
+
+            c: u8 = u8(val(p))
+            if c == '\n':
+                p++
+                continue
+            if c == '\r':
+                if p + 1 < end and p[1] == '\n':
+                    p += 2
+                else:
+                    p += 1
+                continue
+            if c == '\t':
+                # Blank lines may contain spaces + tabs before newline/EOF
+                q: cstr = p + 1
+                while q < end and (val(q) == ' ' or val(q) == '\t'):
+                    q++
+                if q >= end:
+                    ps.p = q
+                    ps.line_indent = -1
+                    return -1
+                if val(q) == '\n':
+                    p = q + 1
+                    continue
+                if val(q) == '\r':
+                    if q + 1 < end and q[1] == '\n':
+                        p = q + 2
+                    else:
+                        p = q + 1
+                    continue
+                lmon_set_error(ps, "mixed spaces and tabs in indentation", p)
+                return -3
+
+            return lmon_compute_indent_level(ps, line_begin, p, first)
+
+        if first == '\t':
+            do:
+                p++
+            while p < end and val(p) == '\t'
+
+            if p >= end:
+                ps.p = p
+                ps.line_indent = -1
+                return -1
+
+            c: u8 = u8(val(p))
+            if c == '\n':
+                p++
+                continue
+            if c == '\r':
+                if p + 1 < end and p[1] == '\n':
+                    p += 2
+                else:
+                    p += 1
+                continue
+            if c == ' ':
+                q: cstr = p + 1
+                while q < end and (val(q) == ' ' or val(q) == '\t'):
+                    q++
+                if q >= end:
+                    ps.p = q
+                    ps.line_indent = -1
+                    return -1
+                if val(q) == '\n':
+                    p = q + 1
+                    continue
+                if val(q) == '\r':
+                    if q + 1 < end and q[1] == '\n':
+                        p = q + 2
+                    else:
+                        p = q + 1
+                    continue
+                lmon_set_error(ps, "mixed tabs and spaces in indentation", p)
+                return -3
+
+            return lmon_compute_indent_level(ps, line_begin, p, first)
+
+        if first == '\n':
+            p++
+            continue
+        if first == '\r':
+            if p + 1 < end and p[1] == '\n':
+                p += 2
+            else:
+                p += 1
+            continue
+
+        ps.p = p
+        ps.line_start = line_begin
+        ps.line_indent = 0
+        return 0
+
+    ps.p = p
+    ps.line_indent = -1
+    return -1
+
+static inline def lmon_consume_line_end(ps: addr[LmonParser], allow_eof: bool) -> bool:
+    p: cstr = ps.p
+    if p >= ps.end:
+        if not allow_eof:
+            lmon_set_error(ps, "unexpected end of input; expected nested block", p)
+            return false
+        ps.line_indent = -1
+        return true
+    c: u8 = u8(val(p))
+    if c == '\n':
+        ps.p = p + 1
+        ps.line_indent = -2
+        return true
+    if c == '\r':
+        if p + 1 < ps.end and p[1] == '\n':
+            ps.p = p + 2
+        else:
+            ps.p = p + 1
+        ps.line_indent = -2
+        return true
+    if c == '\t':
+        lmon_set_error(ps, "tabs are not allowed outside strings", p)
+        return false
+    if c == ' ':
+        lmon_set_error(ps, "trailing spaces are not allowed", p)
+        return false
+    lmon_set_error(ps, "unexpected character at end of line", p)
+    return false
+
+static def lmon_parse_string_raw(ps: addr[LmonParser], out: addr[LmonStr]) -> bool:
+    p: cstr = ps.p
+    end: cstr = ps.end
+    if p >= end or val(p) != '"':
+        lmon_set_error(ps, "expected '\"'", p)
+        return false
+    p++
+    start: cstr = p
+
+    ifdef __ARM_NEON
+    v_quote: uint8x16_t = vdupq_n_u8('"')
+    v_bslash: uint8x16_t = vdupq_n_u8('\\')
+    v_ctrl_or_utf8: int8x16_t = vdupq_n_s8(0x20)
+    while end - p >= 16:
+        chunk: uint8x16_t = vld1q_u8(cast(addr[const u8], p))
+        special: uint8x16_t = vorrq_u8(vorrq_u8(vceqq_u8(chunk, v_quote), vceqq_u8(chunk, v_bslash)), vreinterpretq_u8_s8(vcltq_s8(vreinterpretq_s8_u8(chunk), v_ctrl_or_utf8)))
+        if vmaxvq_u8(special) != 0:
+            break
+        p += 16
+    endif
+
+    while p < end:
+        c: u8 = u8(val(p))
+        if c == '"':
+            out.ptr = start
+            out.len = usize(p - start)
+            ps.p = p + 1
+            return true
+        if c == '\\':
+            break
+        if c < 0x20:
+            lmon_set_error(ps, "unescaped control character in string", p)
+            return false
+        if c >= 0x80:
+            if not lmon_step_utf8_non_ascii(p.addr, end):
+                lmon_set_error(ps, "invalid UTF-8 byte sequence in string", p)
+                return false
+            continue
+        p++
+
+    if p >= end:
+        lmon_set_error(ps, "unterminated string literal", p)
+        return false
+
+    # Slow path: string contains backslash escapes; unescape into arena
+    prefix_len: usize = usize(p - start)
+    scan_end: cstr = p
+    while scan_end < end:
+        if val(scan_end) == '"':
+            break
+        if val(scan_end) == '\\':
+            scan_end++
+            if scan_end >= end:
+                break
+        scan_end++
+    if scan_end >= end or val(scan_end) != '"':
+        lmon_set_error(ps, "unterminated string literal", scan_end)
+        return false
+
+    max_len: usize = usize(scan_end - start)
+    buf: str = cast(str, lmon_arena_alloc(ps.arena, max_len + 1))
+    if buf == nil:
+        lmon_set_error(ps, "out of memory", p)
+        return false
+    if prefix_len > 0:
+        memcpy(buf, start, prefix_len)
+    w: usize = prefix_len
+
+    while p < end:
+        c: u8 = u8(val(p))
+        if c == '"':
+            buf[w] = '\0'
+            out.ptr = buf
+            out.len = w
+            ps.p = p + 1
+            return true
+        if c < 0x20:
+            lmon_set_error(ps, "unescaped control character in string", p)
+            return false
+        if c >= 0x80:
+            u0: cstr = p
+            if not lmon_step_utf8_non_ascii(p.addr, end):
+                lmon_set_error(ps, "invalid UTF-8 byte sequence in string", u0)
+                return false
+            ulen: usize = usize(p - u0)
+            memcpy(buf + w, u0, ulen)
+            w += ulen
+            continue
+        if c != '\\':
+            buf[w++] = char(c)
+            p++
+            continue
+        p++
+        if p >= end:
+            lmon_set_error(ps, "unterminated escape sequence", p)
+            return false
+        esc: u8 = u8(val(p++))
+        switch esc:
+            case '"':
+                buf[w++] = '"'
+                break
+            case '\\':
+                buf[w++] = '\\'
+                break
+            case '/':
+                buf[w++] = '/'
+                break
+            case 'b':
+                buf[w++] = '\b'
+                break
+            case 'f':
+                buf[w++] = '\f'
+                break
+            case 'n':
+                buf[w++] = '\n'
+                break
+            case 'r':
+                buf[w++] = '\r'
+                break
+            case 't':
+                buf[w++] = '\t'
+                break
+            case 'u':
+                if end - p < 4:
+                    lmon_set_error(ps, "invalid \\uXXXX escape sequence", p)
+                    return false
+                h0: i32 = hex_val(u8(p[0]))
+                h1: i32 = hex_val(u8(p[1]))
+                h2: i32 = hex_val(u8(p[2]))
+                h3: i32 = hex_val(u8(p[3]))
+                if (h0 | h1 | h2 | h3) < 0:
+                    lmon_set_error(ps, "invalid \\uXXXX escape sequence", p)
+                    return false
+                cp: u32 = u32((h0 << 12) | (h1 << 8) | (h2 << 4) | h3)
+                p += 4
+                if cp >= 0xD800 and cp <= 0xDBFF:
+                    if end - p < 6 or p[0] != '\\' or p[1] != 'u':
+                        lmon_set_error(ps, "unpaired high surrogate in string", p)
+                        return false
+                    l0: i32 = hex_val(u8(p[2]))
+                    l1: i32 = hex_val(u8(p[3]))
+                    l2: i32 = hex_val(u8(p[4]))
+                    l3: i32 = hex_val(u8(p[5]))
+                    if (l0 | l1 | l2 | l3) < 0:
+                        lmon_set_error(ps, "invalid low surrogate \\uXXXX escape", p + 2)
+                        return false
+                    low: u32 = u32((l0 << 12) | (l1 << 8) | (l2 << 4) | l3)
+                    if low < 0xDC00 or low > 0xDFFF:
+                        lmon_set_error(ps, "expected low surrogate (DC00..DFFF)", p + 2)
+                        return false
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00)
+                    p += 6
+                elif cp >= 0xDC00 and cp <= 0xDFFF:
+                    lmon_set_error(ps, "unpaired low surrogate in string", p - 4)
+                    return false
+                w += encode_utf8(cp, buf + w)
+                break
+            default:
+                lmon_set_error(ps, "invalid escape sequence in string", p - 1)
+                return false
+
+    lmon_set_error(ps, "unterminated string literal", p)
+    return false
+
+static const POW10_POS: f64[16] = {1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15}
+static const POW10_U64: u64[16] = {1ULL, 10ULL, 100ULL, 1000ULL, 10000ULL, 100000ULL, 1000000ULL, 10000000ULL, 100000000ULL, 1000000000ULL, 10000000000ULL, 100000000000ULL, 1000000000000ULL, 10000000000000ULL, 100000000000000ULL, 1000000000000000ULL}
+
+static def lmon_parse_number(ps: addr[LmonParser], out: addr[LmonValue]) -> bool:
+    start: cstr = ps.p
+    p: cstr = start
+    end: cstr = ps.end
+
+    neg: bool = false
+    if p < end and val(p) == '-':
+        neg = true
+        p++
+    if p >= end or val(p) < '0' or val(p) > '9':
+        lmon_set_error(ps, "invalid number literal", start)
+        return false
+
+    mantissa: u64 = 0
+    int_digits: usize = 0
+    if val(p) == '0':
+        p++
+        int_digits = 1
+        if p < end and val(p) >= '0' and val(p) <= '9':
+            lmon_set_error(ps, "leading zeros are not allowed in numbers", p)
+            return false
+    else:
+        while p < end and val(p) >= '0' and val(p) <= '9':
+            if int_digits < 19:
+                mantissa = mantissa * 10 + u64(val(p) - '0')
+            int_digits++
+            p++
+
+    is_float: bool = false
+    frac_digits: usize = 0
+    frac_val: u64 = 0
+
+    if p < end and val(p) == '.':
+        is_float = true
+        p++
+        if p >= end or val(p) < '0' or val(p) > '9':
+            lmon_set_error(ps, "expected digit after decimal point", p)
+            return false
+        while p < end and val(p) >= '0' and val(p) <= '9':
+            if frac_digits < 16:
+                frac_val = frac_val * 10 + u64(val(p) - '0')
+            frac_digits++
+            p++
+
+    has_exp: bool = false
+    if p < end and (val(p) == 'e' or val(p) == 'E'):
+        is_float = true
+        has_exp = true
+        p++
+        if p < end and (val(p) == '+' or val(p) == '-'):
+            p++
+        if p >= end or val(p) < '0' or val(p) > '9':
+            lmon_set_error(ps, "expected digit in exponent", p)
+            return false
+        while p < end and val(p) >= '0' and val(p) <= '9':
+            p++
+
+    if p < end and (val(p) == '.' or val(p) == 'e' or val(p) == 'E' or val(p) == '+' or val(p) == '-'):
+        lmon_set_error(ps, "malformed number literal", p)
+        return false
+
+    ps.p = p
+
+    if not is_float:
+        if int_digits <= 18:
+            out.type = LMON_INT
+            if mantissa == 0:
+                out.u.i = 0
+            elif neg:
+                out.u.i = -i64(mantissa)
+            else:
+                out.u.i = i64(mantissa)
+            return true
+        if int_digits == 19:
+            d: cstr = start
+            max_s: cstr = "9223372036854775807"
+            if neg:
+                d = start + 1
+                max_s = "9223372036854775808"
+            if memcmp(d, max_s, 19) <= 0:
+                out.type = LMON_INT
+                if neg:
+                    if mantissa == 9223372036854775808ULL:
+                        out.u.i = INT64_MIN
+                    else:
+                        out.u.i = -i64(mantissa)
+                else:
+                    out.u.i = i64(mantissa)
+                return true
+
+    dbl: f64 = 0.0
+    if not has_exp and int_digits + frac_digits <= 15:
+        combined: u64 = mantissa * POW10_U64[frac_digits] + frac_val
+        dbl = f64(combined) / POW10_POS[frac_digits]
+        if neg:
+            dbl = -dbl
+    else:
+        nlen: usize = usize(p - start)
+        stack_buf: char[64]
+        heap_buf: str = nil
+        nbuf: str = stack_buf
+        if nlen >= sizeof(stack_buf):
+            heap_buf = cast(str, malloc(nlen + 1))
+            if heap_buf == nil:
+                lmon_set_error(ps, "out of memory", start)
+                return false
+            nbuf = heap_buf
+        memcpy(nbuf, start, nlen)
+        nbuf[nlen] = '\0'
+        errno = 0
+        endptr: str = nil
+        dbl = strtod(nbuf, endptr.addr)
+        free(heap_buf)
+        if isnan(dbl) or isinf(dbl):
+            lmon_set_error(ps, "numeric literal out of finite IEEE-754 range", start)
+            return false
+
+    out.type = LMON_FLOAT
+    out.u.f = dbl
+    return true
+
+static def lmon_parse_inline_value(ps: addr[LmonParser], out: addr[LmonValue]) -> bool
+
+static def lmon_parse_inline_array(ps: addr[LmonParser], out: addr[LmonValue]) -> bool:
+    ps.p++ # '['
+    while ps.p < ps.end and val(ps.p) == ' ':
+        ps.p++
+    if ps.p < ps.end and val(ps.p) == ']':
+        ps.p++
+        out.type = LMON_ARRAY
+        out.u.arr.items = nil
+        out.u.arr.len = 0
+        return true
+
+    stack_buf: LmonValue[16]
+    cap: usize = 16
+    len: usize = 0
+    tmp: addr[LmonValue] = stack_buf
+
+    while true:
+        if len == cap:
+            cap *= 2
+            grown: addr[LmonValue] = nil
+            if tmp == stack_buf:
+                grown = cast(addr[LmonValue], malloc(cap * sizeof(LmonValue)))
+            else:
+                grown = cast(addr[LmonValue], realloc(tmp, cap * sizeof(LmonValue)))
+            if grown == nil:
+                if tmp != stack_buf:
+                    free(tmp)
+                lmon_set_error(ps, "out of memory", ps.p)
+                return false
+            if tmp == stack_buf:
+                memcpy(grown, stack_buf, len * sizeof(LmonValue))
+            tmp = grown
+        if not lmon_parse_inline_value(ps, tmp[len].addr):
+            if tmp != stack_buf:
+                free(tmp)
+            return false
+        len++
+
+        while ps.p < ps.end and val(ps.p) == ' ':
+            ps.p++
+        if ps.p >= ps.end:
+            if tmp != stack_buf:
+                free(tmp)
+            lmon_set_error(ps, "unterminated inline array", ps.p)
+            return false
+        c: char = val(ps.p)
+        if c == ',':
+            ps.p++
+            while ps.p < ps.end and val(ps.p) == ' ':
+                ps.p++
+            if ps.p < ps.end and val(ps.p) == ']':
+                if tmp != stack_buf:
+                    free(tmp)
+                lmon_set_error(ps, "trailing comma in inline array", ps.p)
+                return false
+        elif c == ']':
+            ps.p++
+            break
+        elif c == '\t':
+            if tmp != stack_buf:
+                free(tmp)
+            lmon_set_error(ps, "tabs are not allowed outside strings", ps.p)
+            return false
+        else:
+            if tmp != stack_buf:
+                free(tmp)
+            lmon_set_error(ps, "expected ',' or ']' in inline array", ps.p)
+            return false
+
+    arena_items: addr[LmonValue] = cast(addr[LmonValue], lmon_arena_alloc(ps.arena, len * sizeof(LmonValue)))
+    if arena_items == nil:
+        if tmp != stack_buf:
+            free(tmp)
+        lmon_set_error(ps, "out of memory", ps.p)
+        return false
+    memcpy(arena_items, tmp, len * sizeof(LmonValue))
+    if tmp != stack_buf:
+        free(tmp)
+    out.type = LMON_ARRAY
+    out.u.arr.items = arena_items
+    out.u.arr.len = len
+    return true
+
+static def lmon_parse_inline_value(ps: addr[LmonParser], out: addr[LmonValue]) -> bool:
+    if ps.p >= ps.end:
+        lmon_set_error(ps, "expected value", ps.p)
+        return false
+    c: u8 = u8(val(ps.p))
+    if c == '"':
+        out.type = LMON_STRING
+        return lmon_parse_string_raw(ps, out.u.s.addr)
+    if c == '-' or (c >= '0' and c <= '9'):
+        return lmon_parse_number(ps, out)
+    if c == 't':
+        if ps.end - ps.p >= 4 and memcmp(ps.p, "true", 4) == 0:
+            ps.p += 4
+            out.type = LMON_BOOL
+            out.u.b = true
+            return true
+        lmon_set_error(ps, "invalid literal; expected 'true'", ps.p)
+        return false
+    if c == 'f':
+        if ps.end - ps.p >= 5 and memcmp(ps.p, "false", 5) == 0:
+            ps.p += 5
+            out.type = LMON_BOOL
+            out.u.b = false
+            return true
+        lmon_set_error(ps, "invalid literal; expected 'false'", ps.p)
+        return false
+    if c == 'n':
+        if ps.end - ps.p >= 4 and memcmp(ps.p, "null", 4) == 0:
+            ps.p += 4
+            out.type = LMON_NULL
+            return true
+        lmon_set_error(ps, "invalid literal; expected 'null'", ps.p)
+        return false
+    if c == '[':
+        return lmon_parse_inline_array(ps, out)
+    if c == '{':
+        if ps.end - ps.p >= 2 and ps.p[1] == '}':
+            ps.p += 2
+            out.type = LMON_OBJECT
+            out.u.obj.members = nil
+            out.u.obj.len = 0
+            return true
+        lmon_set_error(ps, "curly-brace objects are not allowed in LMON; use indentation or '{}'", ps.p)
+        return false
+    lmon_set_error(ps, "unexpected character when parsing value", ps.p)
+    return false
+
+static inline def lmon_is_dash_item(ps: addr[const LmonParser]) -> bool:
+    p: cstr = ps.p
+    if p >= ps.end or val(p) != '-':
+        return false
+    if p + 1 >= ps.end:
+        return true
+    nxt: char = p[1]
+    return nxt == ' ' or nxt == '\n' or nxt == '\r'
+
+static inline def lmon_parse_key(ps: addr[LmonParser], out: addr[LmonStr]) -> bool:
+    p: cstr = ps.p
+    if p < ps.end and val(p) == '"':
+        return lmon_parse_string_raw(ps, out)
+    if p >= ps.end or lmon_key_class(u8(val(p))) != 1:
+        lmon_set_error(ps, "expected object key", p)
+        return false
+    start: cstr = p
+    p++
+    while p < ps.end and lmon_key_class(u8(val(p))) != 0:
+        p++
+    len: usize = usize(p - start)
+    if lmon_is_reserved_key(start, len):
+        lmon_set_error(ps, "reserved literal must be quoted when used as a key", start)
+        return false
+    out.ptr = start
+    out.len = len
+    ps.p = p
+    return true
+
+static def lmon_parse_block_object(ps: addr[LmonParser], expected_indent: i32, first_key: addr[const LmonStr], out: addr[LmonValue]) -> bool
+static def lmon_parse_block_array(ps: addr[LmonParser], expected_indent: i32, in_object: bool, out: addr[LmonValue]) -> bool
+
+static def lmon_parse_nested_block(ps: addr[LmonParser], expected_indent: i32, from_object: bool, out: addr[LmonValue]) -> bool:
+    indent: i32 = lmon_peek_line(ps)
+    if indent == -3:
+        return false
+    if indent < 0:
+        lmon_set_error(ps, "expected indented block, got end of input", ps.p)
+        return false
+    if from_object and indent == expected_indent - 1 and lmon_is_dash_item(ps):
+        return lmon_parse_block_array(ps, expected_indent - 1, true, out)
+    if indent != expected_indent:
+        lmon_set_error(ps, "unexpected block indentation level", ps.line_start)
+        return false
+    if lmon_is_dash_item(ps):
+        if from_object:
+            lmon_set_error(ps, "block array under object key must not be indented", ps.line_start)
+            return false
+        return lmon_parse_block_array(ps, expected_indent, false, out)
+    c: u8 = u8(val(ps.p))
+    if c == '"':
+        str_start: cstr = ps.p
+        k: LmonStr
+        if not lmon_parse_string_raw(ps, k.addr):
+            return false
+        if ps.p >= ps.end or val(ps.p) != ':':
+            lmon_set_error(ps, "nested block cannot be a standalone scalar", str_start)
+            return false
+        return lmon_parse_block_object(ps, expected_indent, k.addr, out)
+    if lmon_key_class(c) == 1:
+        return lmon_parse_block_object(ps, expected_indent, nil, out)
+    lmon_set_error(ps, "nested block must be a block object or block array", ps.p)
+    return false
+
+static def lmon_parse_block_object(ps: addr[LmonParser], expected_indent: i32, first_key: addr[const LmonStr], out: addr[LmonValue]) -> bool:
+    stack_buf: LmonMember[16]
+    cap: usize = 16
+    len: usize = 0
+    tmp: addr[LmonMember] = stack_buf
+
+    use_first: bool = first_key != nil
+    while true:
+        key: LmonStr
+        if use_first:
+            key = val(first_key)
+            use_first = false
+        else:
+            indent: i32 = lmon_peek_line(ps)
+            if indent == -3:
+                if tmp != stack_buf:
+                    free(tmp)
+                return false
+            if indent < expected_indent:
+                break
+            if indent > expected_indent:
+                if tmp != stack_buf:
+                    free(tmp)
+                lmon_set_error(ps, "unexpected indentation inside object", ps.line_start)
+                return false
+            if lmon_is_dash_item(ps):
+                if tmp != stack_buf:
+                    free(tmp)
+                lmon_set_error(ps, "cannot mix array items and object keys at same indentation", ps.p)
+                return false
+            if not lmon_parse_key(ps, key.addr):
+                if tmp != stack_buf:
+                    free(tmp)
+                return false
+
+        if ps.p >= ps.end or val(ps.p) != ':':
+            if tmp != stack_buf:
+                free(tmp)
+            lmon_set_error(ps, "expected ':' after object key", ps.p)
+            return false
+        ps.p++
+
+        if len == cap:
+            cap *= 2
+            grown: addr[LmonMember] = nil
+            if tmp == stack_buf:
+                grown = cast(addr[LmonMember], malloc(cap * sizeof(LmonMember)))
+            else:
+                grown = cast(addr[LmonMember], realloc(tmp, cap * sizeof(LmonMember)))
+            if grown == nil:
+                if tmp != stack_buf:
+                    free(tmp)
+                lmon_set_error(ps, "out of memory", ps.p)
+                return false
+            if tmp == stack_buf:
+                memcpy(grown, stack_buf, len * sizeof(LmonMember))
+            tmp = grown
+
+        tmp[len].key = key
+        if ps.p < ps.end and val(ps.p) == ' ':
+            ps.p++
+            if not lmon_parse_inline_value(ps, tmp[len].val.addr) or not lmon_consume_line_end(ps, true):
+                if tmp != stack_buf:
+                    free(tmp)
+                return false
+        else:
+            if not lmon_consume_line_end(ps, false) or not lmon_parse_nested_block(ps, expected_indent + 1, true, tmp[len].val.addr):
+                if tmp != stack_buf:
+                    free(tmp)
+                return false
+        len++
+
+    arena_members: addr[LmonMember] = cast(addr[LmonMember], lmon_arena_alloc(ps.arena, len * sizeof(LmonMember)))
+    if arena_members == nil:
+        if tmp != stack_buf:
+            free(tmp)
+        lmon_set_error(ps, "out of memory", ps.p)
+        return false
+    memcpy(arena_members, tmp, len * sizeof(LmonMember))
+    if tmp != stack_buf:
+        free(tmp)
+    out.type = LMON_OBJECT
+    out.u.obj.members = arena_members
+    out.u.obj.len = len
+    return true
+
+static def lmon_parse_block_array(ps: addr[LmonParser], expected_indent: i32, in_object: bool, out: addr[LmonValue]) -> bool:
+    stack_buf: LmonValue[16]
+    cap: usize = 16
+    len: usize = 0
+    tmp: addr[LmonValue] = stack_buf
+
+    while true:
+        indent: i32 = lmon_peek_line(ps)
+        if indent == -3:
+            if tmp != stack_buf:
+                free(tmp)
+            return false
+        if indent < expected_indent:
+            break
+        if indent > expected_indent:
+            if tmp != stack_buf:
+                free(tmp)
+            lmon_set_error(ps, "unexpected indentation inside array", ps.line_start)
+            return false
+        if not lmon_is_dash_item(ps):
+            if in_object:
+                break
+            if tmp != stack_buf:
+                free(tmp)
+            lmon_set_error(ps, "cannot mix object keys and array items at same indentation", ps.p)
+            return false
+        ps.p++ # '-'
+
+        if len == cap:
+            cap *= 2
+            grown: addr[LmonValue] = nil
+            if tmp == stack_buf:
+                grown = cast(addr[LmonValue], malloc(cap * sizeof(LmonValue)))
+            else:
+                grown = cast(addr[LmonValue], realloc(tmp, cap * sizeof(LmonValue)))
+            if grown == nil:
+                if tmp != stack_buf:
+                    free(tmp)
+                lmon_set_error(ps, "out of memory", ps.p)
+                return false
+            if tmp == stack_buf:
+                memcpy(grown, stack_buf, len * sizeof(LmonValue))
+            tmp = grown
+
+        if ps.p < ps.end and val(ps.p) == ' ':
+            ps.p++
+            if not lmon_parse_inline_value(ps, tmp[len].addr) or not lmon_consume_line_end(ps, true):
+                if tmp != stack_buf:
+                    free(tmp)
+                return false
+        else:
+            if not lmon_consume_line_end(ps, false) or not lmon_parse_nested_block(ps, expected_indent + 1, false, tmp[len].addr):
+                if tmp != stack_buf:
+                    free(tmp)
+                return false
+        len++
+
+    arena_items: addr[LmonValue] = cast(addr[LmonValue], lmon_arena_alloc(ps.arena, len * sizeof(LmonValue)))
+    if arena_items == nil:
+        if tmp != stack_buf:
+            free(tmp)
+        lmon_set_error(ps, "out of memory", ps.p)
+        return false
+    memcpy(arena_items, tmp, len * sizeof(LmonValue))
+    if tmp != stack_buf:
+        free(tmp)
+    out.type = LMON_ARRAY
+    out.u.arr.items = arena_items
+    out.u.arr.len = len
+    return true
+
+def lmon_parse(src: cstr, len: usize, arena: addr[LmonArena], err: addr[LmonError]) -> addr[LmonValue]:
+    if err != nil:
+        memset(err, 0, sizeof(LmonError))
+
+    ps: LmonParser
+    ps.src = src
+    ps.end = src + len
+    ps.p = src
+    ps.line_start = src
+    ps.line_indent = -2
+    ps.indent_char = 0
+    ps.indent_width = 0
+    ps.indent_shift = 0
+    ps.arena = arena
+    ps.err = err
+
+    if len >= 3 and u8(src[0]) == 0xEF and u8(src[1]) == 0xBB and u8(src[2]) == 0xBF:
+        lmon_set_error(ps.addr, "UTF-8 BOM is not allowed", src)
+        return nil
+
+    indent: i32 = lmon_peek_line(ps.addr)
+    if indent == -3:
+        return nil
+    if indent < 0:
+        lmon_set_error(ps.addr, "empty LMON document", ps.p)
+        return nil
+    if indent != 0:
+        lmon_set_error(ps.addr, "root value must not be indented", ps.line_start)
+        return nil
+
+    root: addr[LmonValue] = cast(addr[LmonValue], lmon_arena_alloc(arena, sizeof(LmonValue)))
+    if root == nil:
+        lmon_set_error(ps.addr, "out of memory", src)
+        return nil
+
+    ok: bool = false
+    if lmon_is_dash_item(ps.addr):
+        ok = lmon_parse_block_array(ps.addr, 0, false, root)
+    else:
+        c: u8 = u8(val(ps.p))
+        if c == '"':
+            first_s: LmonStr
+            if not lmon_parse_string_raw(ps.addr, first_s.addr):
+                return nil
+            if ps.p < ps.end and val(ps.p) == ':':
+                ok = lmon_parse_block_object(ps.addr, 0, first_s.addr, root)
+            else:
+                if not lmon_consume_line_end(ps.addr, true):
+                    return nil
+                root.type = LMON_STRING
+                root.u.s = first_s
+                ok = true
+        elif lmon_key_class(c) == 1:
+            q: cstr = ps.p + 1
+            while q < ps.end and lmon_key_class(u8(val(q))) != 0:
+                q++
+            ilen: usize = usize(q - ps.p)
+            if lmon_is_reserved_key(ps.p, ilen) and (q >= ps.end or val(q) != ':'):
+                ok = lmon_parse_inline_value(ps.addr, root) and lmon_consume_line_end(ps.addr, true)
+            else:
+                ok = lmon_parse_block_object(ps.addr, 0, nil, root)
+        else:
+            ok = lmon_parse_inline_value(ps.addr, root) and lmon_consume_line_end(ps.addr, true)
+
+    if not ok:
+        return nil
+
+    trailing: i32 = lmon_peek_line(ps.addr)
+    if trailing == -3:
+        return nil
+    if trailing != -1:
+        lmon_set_error(ps.addr, "unexpected trailing content after root value", ps.line_start)
+        return nil
+
+    return root
+
+# -------------------------------------------------------------------------
+# RFC 8259 JSON Parser (same Flat DOM + SIMD String Scanner for fair bench)
+# -------------------------------------------------------------------------
+
+static inline def json_skip_ws(ps: addr[LmonParser]):
+    while ps.p < ps.end:
+        c: u8 = u8(val(ps.p))
+        if c == ' ' or c == '\t' or c == '\n' or c == '\r':
+            ps.p++
+        else:
+            break
+
+static def json_parse_value(ps: addr[LmonParser], out: addr[LmonValue]) -> bool
+
+static def json_parse_array(ps: addr[LmonParser], out: addr[LmonValue]) -> bool:
+    ps.p++ # '['
+    json_skip_ws(ps)
+    if ps.p < ps.end and val(ps.p) == ']':
+        ps.p++
+        out.type = LMON_ARRAY
+        out.u.arr.items = nil
+        out.u.arr.len = 0
+        return true
+
+    stack_buf: LmonValue[16]
+    cap: usize = 16
+    len: usize = 0
+    tmp: addr[LmonValue] = stack_buf
+    while true:
+        json_skip_ws(ps)
+        if len == cap:
+            cap *= 2
+            g: addr[LmonValue] = nil
+            if tmp == stack_buf:
+                g = cast(addr[LmonValue], malloc(cap * sizeof(LmonValue)))
+            else:
+                g = cast(addr[LmonValue], realloc(tmp, cap * sizeof(LmonValue)))
+            if g == nil:
+                if tmp != stack_buf:
+                    free(tmp)
+                return false
+            if tmp == stack_buf:
+                memcpy(g, stack_buf, len * sizeof(LmonValue))
+            tmp = g
+        if not json_parse_value(ps, tmp[len].addr):
+            if tmp != stack_buf:
+                free(tmp)
+            return false
+        len++
+        json_skip_ws(ps)
+        if ps.p >= ps.end:
+            if tmp != stack_buf:
+                free(tmp)
+            lmon_set_error(ps, "unterminated JSON array", ps.p)
+            return false
+        if val(ps.p) == ',':
+            ps.p++
+        elif val(ps.p) == ']':
+            ps.p++
+            break
+        else:
+            if tmp != stack_buf:
+                free(tmp)
+            lmon_set_error(ps, "expected ',' or ']' in JSON array", ps.p)
+            return false
+
+    items: addr[LmonValue] = cast(addr[LmonValue], lmon_arena_alloc(ps.arena, len * sizeof(LmonValue)))
+    if items == nil:
+        if tmp != stack_buf:
+            free(tmp)
+        return false
+    memcpy(items, tmp, len * sizeof(LmonValue))
+    if tmp != stack_buf:
+        free(tmp)
+    out.type = LMON_ARRAY
+    out.u.arr.items = items
+    out.u.arr.len = len
+    return true
+
+static def json_parse_object(ps: addr[LmonParser], out: addr[LmonValue]) -> bool:
+    ps.p++ # '{'
+    json_skip_ws(ps)
+    if ps.p < ps.end and val(ps.p) == '}':
+        ps.p++
+        out.type = LMON_OBJECT
+        out.u.obj.members = nil
+        out.u.obj.len = 0
+        return true
+
+    stack_buf: LmonMember[16]
+    cap: usize = 16
+    len: usize = 0
+    tmp: addr[LmonMember] = stack_buf
+    while true:
+        json_skip_ws(ps)
+        key: LmonStr
+        if not lmon_parse_string_raw(ps, key.addr):
+            if tmp != stack_buf:
+                free(tmp)
+            return false
+        json_skip_ws(ps)
+        if ps.p >= ps.end or val(ps.p) != ':':
+            if tmp != stack_buf:
+                free(tmp)
+            lmon_set_error(ps, "expected ':' in JSON object", ps.p)
+            return false
+        ps.p++
+        json_skip_ws(ps)
+        if len == cap:
+            cap *= 2
+            g: addr[LmonMember] = nil
+            if tmp == stack_buf:
+                g = cast(addr[LmonMember], malloc(cap * sizeof(LmonMember)))
+            else:
+                g = cast(addr[LmonMember], realloc(tmp, cap * sizeof(LmonMember)))
+            if g == nil:
+                if tmp != stack_buf:
+                    free(tmp)
+                return false
+            if tmp == stack_buf:
+                memcpy(g, stack_buf, len * sizeof(LmonMember))
+            tmp = g
+        tmp[len].key = key
+        if not json_parse_value(ps, tmp[len].val.addr):
+            if tmp != stack_buf:
+                free(tmp)
+            return false
+        len++
+        json_skip_ws(ps)
+        if ps.p >= ps.end:
+            if tmp != stack_buf:
+                free(tmp)
+            lmon_set_error(ps, "unterminated JSON object", ps.p)
+            return false
+        if val(ps.p) == ',':
+            ps.p++
+        elif val(ps.p) == '}':
+            ps.p++
+            break
+        else:
+            if tmp != stack_buf:
+                free(tmp)
+            lmon_set_error(ps, "expected ',' or '}' in JSON object", ps.p)
+            return false
+
+    members: addr[LmonMember] = cast(addr[LmonMember], lmon_arena_alloc(ps.arena, len * sizeof(LmonMember)))
+    if members == nil:
+        if tmp != stack_buf:
+            free(tmp)
+        return false
+    memcpy(members, tmp, len * sizeof(LmonMember))
+    if tmp != stack_buf:
+        free(tmp)
+    out.type = LMON_OBJECT
+    out.u.obj.members = members
+    out.u.obj.len = len
+    return true
+
+static def json_parse_value(ps: addr[LmonParser], out: addr[LmonValue]) -> bool:
+    if ps.p >= ps.end:
+        lmon_set_error(ps, "expected JSON value", ps.p)
+        return false
+    c: u8 = u8(val(ps.p))
+    switch c:
+        case '{':
+            return json_parse_object(ps, out)
+        case '[':
+            return json_parse_array(ps, out)
+        case '"':
+            out.type = LMON_STRING
+            return lmon_parse_string_raw(ps, out.u.s.addr)
+        case 't':
+            if ps.end - ps.p >= 4 and memcmp(ps.p, "true", 4) == 0:
+                ps.p += 4
+                out.type = LMON_BOOL
+                out.u.b = true
+                return true
+            lmon_set_error(ps, "invalid JSON literal", ps.p)
+            return false
+        case 'f':
+            if ps.end - ps.p >= 5 and memcmp(ps.p, "false", 5) == 0:
+                ps.p += 5
+                out.type = LMON_BOOL
+                out.u.b = false
+                return true
+            lmon_set_error(ps, "invalid JSON literal", ps.p)
+            return false
+        case 'n':
+            if ps.end - ps.p >= 4 and memcmp(ps.p, "null", 4) == 0:
+                ps.p += 4
+                out.type = LMON_NULL
+                return true
+            lmon_set_error(ps, "invalid JSON literal", ps.p)
+            return false
+        default:
+            return lmon_parse_number(ps, out)
+
+def lmon_parse_json(src: cstr, len: usize, arena: addr[LmonArena], err: addr[LmonError]) -> addr[LmonValue]:
+    if err != nil:
+        memset(err, 0, sizeof(LmonError))
+    ps: LmonParser
+    memset(ps.addr, 0, sizeof(LmonParser))
+    ps.src = src
+    ps.end = src + len
+    ps.p = src
+    ps.arena = arena
+    ps.err = err
+
+    root: addr[LmonValue] = cast(addr[LmonValue], lmon_arena_alloc(arena, sizeof(LmonValue)))
+    if root == nil:
+        return nil
+
+    json_skip_ws(ps.addr)
+    if not json_parse_value(ps.addr, root):
+        return nil
+    json_skip_ws(ps.addr)
+    if ps.p != ps.end:
+        lmon_set_error(ps.addr, "trailing data after JSON value", ps.p)
+        return nil
+    return root
+
+# -------------------------------------------------------------------------
+# JSON & Canonical LMON Serializers
+# -------------------------------------------------------------------------
+
+static def lmon_write_escaped_str(b: addr[LmonBuf], s: LmonStr):
+    lmon_buf_putc(b, '"')
+    p: cstr = s.ptr
+    end: cstr = p + s.len
+    chunk: cstr = p
+    while p < end:
+        c: u8 = u8(val(p))
+        if c == '"' or c == '\\' or c < 0x20:
+            if p > chunk:
+                lmon_buf_append(b, chunk, usize(p - chunk))
+            u: char[7]
+            switch c:
+                case '"':
+                    lmon_buf_append(b, "\\\"", 2)
+                    break
+                case '\\':
+                    lmon_buf_append(b, "\\\\", 2)
+                    break
+                case '\b':
+                    lmon_buf_append(b, "\\b", 2)
+                    break
+                case '\f':
+                    lmon_buf_append(b, "\\f", 2)
+                    break
+                case '\n':
+                    lmon_buf_append(b, "\\n", 2)
+                    break
+                case '\r':
+                    lmon_buf_append(b, "\\r", 2)
+                    break
+                case '\t':
+                    lmon_buf_append(b, "\\t", 2)
+                    break
+                default:
+                    snprintf(u, sizeof(u), "\\u%04x", u32(c))
+                    lmon_buf_append(b, u, 6)
+                    break
+            p++
+            chunk = p
+        else:
+            p++
+    if p > chunk:
+        lmon_buf_append(b, chunk, usize(p - chunk))
+    lmon_buf_putc(b, '"')
+
+static inline def lmon_write_int(b: addr[LmonBuf], val: i64):
+    num: char[32]
+    n: i32 = snprintf(num, sizeof(num), "%" PRId64, val)
+    if n > 0:
+        lmon_buf_append(b, num, usize(n))
+
+static def lmon_write_float(b: addr[LmonBuf], f: f64):
+    if f == 0.0:
+        lmon_buf_append(b, "0.0", 3)
+        return
+    num: char[64]
+    n: i32 = snprintf(num, sizeof(num), "%.17g", f)
+    if n < 0:
+        return
+    short_num: char[64]
+    sn: i32 = snprintf(short_num, sizeof(short_num), "%.15g", f)
+    if sn > 0 and strtod(short_num, nil) == f:
+        memcpy(num, short_num, usize(sn) + 1)
+        n = sn
+    has_dot_or_exp: bool = false
+    for i in range(n):
+        if num[i] == '.' or num[i] == 'e' or num[i] == 'E':
+            has_dot_or_exp = true
+            break
+    lmon_buf_append(b, num, usize(n))
+    if not has_dot_or_exp:
+        lmon_buf_append(b, ".0", 2)
+
+static def lmon_write_json_rec(b: addr[LmonBuf], v: addr[const LmonValue], pretty: bool, depth: usize):
+    switch v.type:
+        case LMON_NULL:
+            lmon_buf_append(b, "null", 4)
+            break
+        case LMON_BOOL:
+            if v.u.b:
+                lmon_buf_append(b, "true", 4)
+            else:
+                lmon_buf_append(b, "false", 5)
+            break
+        case LMON_INT:
+            lmon_write_int(b, v.u.i)
+            break
+        case LMON_FLOAT:
+            lmon_write_float(b, v.u.f)
+            break
+        case LMON_STRING:
+            lmon_write_escaped_str(b, v.u.s)
+            break
+        case LMON_ARRAY:
+            if v.u.arr.len == 0:
+                lmon_buf_append(b, "[]", 2)
+                break
+            lmon_buf_putc(b, '[')
+            for i: usize in range(v.u.arr.len):
+                if i > 0:
+                    lmon_buf_putc(b, ',')
+                if pretty:
+                    lmon_buf_putc(b, '\n')
+                    lmon_buf_spaces(b, (depth + 1) * 2)
+                lmon_write_json_rec(b, v.u.arr.items[i].addr, pretty, depth + 1)
+            if pretty:
+                lmon_buf_putc(b, '\n')
+                lmon_buf_spaces(b, depth * 2)
+            lmon_buf_putc(b, ']')
+            break
+        case LMON_OBJECT:
+            if v.u.obj.len == 0:
+                lmon_buf_append(b, "{}", 2)
+                break
+            lmon_buf_putc(b, '{')
+            for i: usize in range(v.u.obj.len):
+                if i > 0:
+                    lmon_buf_putc(b, ',')
+                if pretty:
+                    lmon_buf_putc(b, '\n')
+                    lmon_buf_spaces(b, (depth + 1) * 2)
+                lmon_write_escaped_str(b, v.u.obj.members[i].key)
+                if pretty:
+                    lmon_buf_append(b, ": ", 2)
+                else:
+                    lmon_buf_putc(b, ':')
+                lmon_write_json_rec(b, v.u.obj.members[i].val.addr, pretty, depth + 1)
+            if pretty:
+                lmon_buf_putc(b, '\n')
+                lmon_buf_spaces(b, depth * 2)
+            lmon_buf_putc(b, '}')
+            break
+
+def lmon_to_json(v: addr[const LmonValue], pretty: bool, out_len: addr[usize]) -> str:
+    b: LmonBuf
+    if not lmon_buf_init(b.addr, 512):
+        return nil
+    lmon_write_json_rec(b.addr, v, pretty, 0)
+    lmon_buf_putc(b.addr, '\n')
+    if out_len != nil:
+        val(out_len) = b.len
+    return b.data
+
+static def lmon_key_can_be_unquoted(k: LmonStr) -> bool:
+    if k.len == 0:
+        return false
+    if lmon_is_reserved_key(k.ptr, k.len):
+        return false
+    if lmon_key_class(u8(k.ptr[0])) != 1:
+        return false
+    for i: usize in range(1, k.len):
+        if lmon_key_class(u8(k.ptr[i])) == 0:
+            return false
+    return true
+
+static def lmon_try_write_inline(b: addr[LmonBuf], v: addr[const LmonValue]) -> bool:
+    switch v.type:
+        case LMON_NULL:
+            lmon_buf_append(b, "null", 4)
+            return true
+        case LMON_BOOL:
+            if v.u.b:
+                lmon_buf_append(b, "true", 4)
+            else:
+                lmon_buf_append(b, "false", 5)
+            return true
+        case LMON_INT:
+            lmon_write_int(b, v.u.i)
+            return true
+        case LMON_FLOAT:
+            lmon_write_float(b, v.u.f)
+            return true
+        case LMON_STRING:
+            lmon_write_escaped_str(b, v.u.s)
+            return true
+        case LMON_OBJECT:
+            if v.u.obj.len == 0:
+                lmon_buf_append(b, "{}", 2)
+                return true
+            return false
+        case LMON_ARRAY:
+            if v.u.arr.len == 0:
+                lmon_buf_append(b, "[]", 2)
+                return true
+            start_len: usize = b.len
+            lmon_buf_putc(b, '[')
+            for i: usize in range(v.u.arr.len):
+                if i > 0:
+                    lmon_buf_append(b, ", ", 2)
+                if not lmon_try_write_inline(b, v.u.arr.items[i].addr):
+                    b.len = start_len
+                    b.data[b.len] = '\0'
+                    return false
+                if b.len - start_len + 1 > 80:
+                    b.len = start_len
+                    b.data[b.len] = '\0'
+                    return false
+            lmon_buf_putc(b, ']')
+            if b.len - start_len > 80:
+                b.len = start_len
+                b.data[b.len] = '\0'
+                return false
+            return true
+    return false
+
+static def lmon_valid_indent_unit(unit: cstr, out_len: addr[usize]) -> bool:
+    if unit == nil or unit[0] == '\0':
+        return false
+    ch: char = unit[0]
+    if ch != ' ' and ch != '\t':
+        return false
+    n: usize = 1
+    while unit[n] != '\0':
+        if unit[n] != ch:
+            return false
+        n++
+    val(out_len) = n
+    return true
+
+static def lmon_emit_block(b: addr[LmonBuf], v: addr[const LmonValue], depth: usize, unit: cstr, unit_len: usize):
+    if v.type == LMON_OBJECT:
+        for i: usize in range(v.u.obj.len):
+            lmon_buf_repeat_unit(b, unit, unit_len, depth)
+            k: LmonStr = v.u.obj.members[i].key
+            if lmon_key_can_be_unquoted(k):
+                lmon_buf_append(b, k.ptr, k.len)
+            else:
+                lmon_write_escaped_str(b, k)
+            lmon_buf_putc(b, ':')
+
+            colon_pos: usize = b.len
+            lmon_buf_putc(b, ' ')
+            if lmon_try_write_inline(b, v.u.obj.members[i].val.addr):
+                lmon_buf_putc(b, '\n')
+            else:
+                b.len = colon_pos
+                b.data[b.len] = '\0'
+                lmon_buf_putc(b, '\n')
+                child_depth: usize = depth + 1
+                if v.u.obj.members[i].val.type == LMON_ARRAY:
+                    child_depth = depth
+                lmon_emit_block(b, v.u.obj.members[i].val.addr, child_depth, unit, unit_len)
+    elif v.type == LMON_ARRAY:
+        for i: usize in range(v.u.arr.len):
+            lmon_buf_repeat_unit(b, unit, unit_len, depth)
+            lmon_buf_putc(b, '-')
+
+            dash_pos: usize = b.len
+            lmon_buf_putc(b, ' ')
+            if lmon_try_write_inline(b, v.u.arr.items[i].addr):
+                lmon_buf_putc(b, '\n')
+            else:
+                b.len = dash_pos
+                b.data[b.len] = '\0'
+                lmon_buf_putc(b, '\n')
+                lmon_emit_block(b, v.u.arr.items[i].addr, depth + 1, unit, unit_len)
+
+def lmon_to_lmon_indent(v: addr[const LmonValue], indent_unit: cstr, out_len: addr[usize]) -> str:
+    unit: cstr = "    "
+    if indent_unit != nil:
+        unit = indent_unit
+    unit_len: usize = 0
+    if not lmon_valid_indent_unit(unit, unit_len.addr):
+        return nil
+
+    b: LmonBuf
+    if not lmon_buf_init(b.addr, 512):
+        return nil
+    if lmon_try_write_inline(b.addr, v):
+        lmon_buf_putc(b.addr, '\n')
+    else:
+        lmon_emit_block(b.addr, v, 0, unit, unit_len)
+    if out_len != nil:
+        val(out_len) = b.len
+    return b.data
+
+def lmon_to_lmon(v: addr[const LmonValue], out_len: addr[usize]) -> str:
+    return lmon_to_lmon_indent(v, "    ", out_len)
+
+# -------------------------------------------------------------------------
+# Standalone CLI, Conformance Tests, and Head-to-Head Benchmark
+# -------------------------------------------------------------------------
+ifndef LMON_NO_MAIN
+
+static def read_stream_all(fp: addr[FILE], out_len: addr[usize]) -> str:
+    cap: usize = 4096
+    len: usize = 0
+    buf: str = cast(str, malloc(cap))
+    if buf == nil:
+        return nil
+    while true:
+        if cap - len < 1024:
+            cap *= 2
+            nb: str = cast(str, realloc(buf, cap))
+            if nb == nil:
+                free(buf)
+                return nil
+            buf = nb
+        n: usize = fread(buf + len, 1, cap - len - 1, fp)
+        len += n
+        if n == 0:
+            if ferror(fp) != 0:
+                free(buf)
+                return nil
+            break
+    buf[len] = '\0'
+    val(out_len) = len
+    return buf
+
+static def read_file_all(path: cstr, out_len: addr[usize]) -> str:
+    fp: addr[FILE] = fopen(path, "rb")
+    if fp == nil:
+        return nil
+    data: str = read_stream_all(fp, out_len)
+    fclose(fp)
+    return data
+
+static def monotonic_sec() -> f64:
+    ts: struct timespec
+    clock_gettime(CLOCK_MONOTONIC, ts.addr)
+    return f64(ts.tv_sec) + f64(ts.tv_nsec) * 1e-9
+
+static def run_tests() -> i32:
+    json_cases: cstr[8]
+    json_cases[0] = "{}"
+    json_cases[1] = "[]"
+    json_cases[2] = "-99"
+    json_cases[3] = "\"hello: world\""
+    json_cases[4] = "true"
+    json_cases[5] = "null"
+    json_cases[6] = "{\"s\":\"Lemon\",\"i\":-42,\"f\":3.25,\"t\":true,\"fa\":false,\"n\":null}"
+    json_cases[7] = "{\"service\":\"lmon\",\"tags\":[\"a\",\"b\",\"c\"],\"empty_map\":{},\"empty_list\":[],\"matrix\":[[1,2],[3,4]],\"nodes\":[{\"id\":1,\"meta\":{\"ok\":true}},{\"id\":2,\"meta\":{}}],\"\":\"empty\",\"true\":\"keyword\",\"false\":false,\"null\":null,\"123\":\"numeric-key\",\"-dash\":\"dash-key\",\"with space\":\"quoted\\nline\\t\\ud83c\\udf4b\"}"
+
+    indents: cstr[10]
+    indents[0] = " "
+    indents[1] = "  "
+    indents[2] = "   "
+    indents[3] = "    "
+    indents[4] = "     "
+    indents[5] = "      "
+    indents[6] = "       "
+    indents[7] = "        "
+    indents[8] = "\t"
+    indents[9] = "\t\t"
+
+    num_cases: usize = 8
+    num_indents: usize = 10
+
+    for i: usize in range(num_cases):
+        for u: usize in range(num_indents):
+            a1: LmonArena
+            a2: LmonArena
+            err: LmonError
+            lmon_arena_init(a1.addr, 4096)
+            lmon_arena_init(a2.addr, 4096)
+
+            v1: addr[LmonValue] = lmon_parse_json(json_cases[i], strlen(json_cases[i]), a1.addr, err.addr)
+            if v1 == nil:
+                fprintf(stderr, "FAIL [case %zu json parse]: %s\n", i, err.message)
+                return 1
+            lmon_len: usize = 0
+            lmon_txt: str = lmon_to_lmon_indent(v1, indents[u], lmon_len.addr)
+            v2: addr[LmonValue] = lmon_parse(lmon_txt, lmon_len, a2.addr, err.addr)
+            if v2 == nil:
+                fprintf(stderr, "FAIL [case %zu indent %zu lmon parse]: %s\n", i, u, err.message)
+                free(lmon_txt)
+                return 1
+            j1: str = lmon_to_json(v1, false, nil)
+            j2: str = lmon_to_json(v2, false, nil)
+            if strcmp(j1, j2) != 0:
+                fprintf(stderr, "FAIL [case %zu mismatch]\nGot: %sExp: %s", i, j2, j1)
+                return 1
+            free(j1)
+            free(j2)
+            free(lmon_txt)
+            lmon_arena_free(a1.addr)
+            lmon_arena_free(a2.addr)
+
+    # Universal newlines test (\r\n and bare \r mixed with \n)
+    univ: cstr = "a:\r\n\tb: 1\rc:\r-\r\n\tx: true\r- 2\r"
+    au: LmonArena
+    erru: LmonError
+    lmon_arena_init(au.addr, 1024)
+    vu: addr[LmonValue] = lmon_parse(univ, strlen(univ), au.addr, erru.addr)
+    if vu == nil:
+        fprintf(stderr, "FAIL [universal_newlines]: %s\n", erru.message)
+        return 1
+    ju: str = lmon_to_json(vu, false, nil)
+    if strcmp(ju, "{\"a\":{\"b\":1},\"c\":[{\"x\":true},2]}\n") != 0:
+        fprintf(stderr, "FAIL [universal_newlines value]: %s", ju)
+        return 1
+    free(ju)
+    lmon_arena_free(au.addr)
+
+    invalid_cases: cstr[23]
+    invalid_cases[0] = ""
+    invalid_cases[1] = "   \n"
+    invalid_cases[2] = "   bad_indent_root: 1\n"
+    invalid_cases[3] = "\tbad_indent_root_tab: 1\n"
+    invalid_cases[4] = "a:\n    b: 1\n  c: 2\n"
+    invalid_cases[5] = "a:\n   b: 1\n     c: 2\n"
+    invalid_cases[6] = "a:\n  b:\n      c: 1\n"
+    invalid_cases[7] = "a:\n\tb:\n\t\t\tc: 1\n"
+    invalid_cases[8] = "a:\n\t\tb: 1\n\tc: 2\n"
+    invalid_cases[9] = "a:\n  b: 1\n\tc: 2\n"
+    invalid_cases[10] = "a:\n\tb: 1\n  c: 2\n"
+    invalid_cases[11] = "a:\n \tb: 1\n"
+    invalid_cases[12] = "a:\n    - 1\n"
+    invalid_cases[13] = "dangling:\n"
+    invalid_cases[14] = "dangling:\nstill_root: 1\n"
+    invalid_cases[15] = "curly: {\"a\": 1}\n"
+    invalid_cases[16] = "true: 1\n"
+    invalid_cases[17] = "trailing_space: 1 \n"
+    invalid_cases[18] = "two_spaces:  1\n"
+    invalid_cases[19] = "bad_num: 01\n"
+    invalid_cases[20] = "trailing_comma: [1, 2,]\n"
+    invalid_cases[21] = "mixed: 1\n- 2\n"
+    invalid_cases[22] = "# comments are forbidden\na: 1\n"
+
+    num_invalid: usize = 23
+    for i: usize in range(num_invalid):
+        a: LmonArena
+        err: LmonError
+        lmon_arena_init(a.addr, 1024)
+        v: addr[LmonValue] = lmon_parse(invalid_cases[i], strlen(invalid_cases[i]), a.addr, err.addr)
+        lmon_arena_free(a.addr)
+        if v != nil:
+            fprintf(stderr, "FAIL [invalid %zu accepted]: %s\n", i, invalid_cases[i])
+            return 1
+
+    printf("Pura LMON: all %zu conformance tests passed.\n", num_cases * num_indents + 1 + num_invalid)
+    return 0
+
+static def run_bench(path: cstr) -> i32:
+    lmon4_sample: str = nil
+    lmon4_len: usize = 0
+
+    if path != nil:
+        lmon4_sample = read_file_all(path, lmon4_len.addr)
+        if lmon4_sample == nil:
+            fprintf(stderr, "lmon error: cannot read '%s'\n", path)
+            return 1
+    else:
+        b: LmonBuf
+        lmon_buf_init(b.addr, 65536)
+        lmon_buf_append(b.addr, "cluster: \"lmon-bench\"\ncount: 500\nnodes:\n", 40)
+        for i in range(500):
+            row: char[256]
+            active_s: cstr = "false"
+            if i % 2 == 0:
+                active_s = "true"
+            n: i32 = snprintf(row, sizeof(row), "-\n    id: %d\n    name: \"service-node-%d\"\n    active: %s\n    latency_ms: %.3f\n    tags: [\"edge\", \"lemon\", \"v1\"]\n    meta:\n        region: \"eu-central\"\n        capacity: %d\n        extra: {}\n", i, i, active_s, 1.25 * f64(i % 17), 256 + i)
+            lmon_buf_append(b.addr, row, usize(n))
+        lmon4_sample = b.data
+        lmon4_len = b.len
+
+    setup_arena: LmonArena
+    err: LmonError
+    lmon_arena_init(setup_arena.addr, lmon4_len * 2 + 4096)
+    parsed: addr[LmonValue] = lmon_parse(lmon4_sample, lmon4_len, setup_arena.addr, err.addr)
+    if parsed == nil:
+        fprintf(stderr, "lmon bench parse error: %s (line %zu)\n", err.message, err.line)
+        free(lmon4_sample)
+        lmon_arena_free(setup_arena.addr)
+        return 1
+
+    lmon_tab_len: usize = 0
+    lmon_tab_sample: str = lmon_to_lmon_indent(parsed, "\t", lmon_tab_len.addr)
+    json_len: usize = 0
+    json_sample: str = lmon_to_json(parsed, true, json_len.addr)
+    if path == nil:
+        free(lmon4_sample)
+        lmon4_sample = lmon_to_lmon_indent(parsed, "    ", lmon4_len.addr)
+    lmon_arena_free(setup_arena.addr)
+
+    kb: f64 = f64(lmon4_len) / 1024.0
+    denom: f64 = kb
+    if denom < 1.0:
+        denom = 1.0
+    iterations: usize = usize(300000.0 / denom)
+    if iterations < 200:
+        iterations = 200
+
+    bench_arena: LmonArena
+    lmon_arena_init(bench_arena.addr, lmon4_len * 4 + 16384)
+
+    for w in range(20):
+        lmon_arena_reset(bench_arena.addr)
+        lmon_parse(lmon4_sample, lmon4_len, bench_arena.addr, err.addr)
+
+    sink: usize = 0
+    t0: f64 = monotonic_sec()
+    for i: usize in range(iterations):
+        lmon_arena_reset(bench_arena.addr)
+        v: addr[LmonValue] = lmon_parse(lmon4_sample, lmon4_len, bench_arena.addr, err.addr)
+        sink += usize(v.type)
+    lmon4_sec: f64 = monotonic_sec() - t0
+
+    t_tab: f64 = monotonic_sec()
+    for i: usize in range(iterations):
+        lmon_arena_reset(bench_arena.addr)
+        v: addr[LmonValue] = lmon_parse(lmon_tab_sample, lmon_tab_len, bench_arena.addr, err.addr)
+        sink += usize(v.type)
+    lmon_tab_sec: f64 = monotonic_sec() - t_tab
+
+    t1: f64 = monotonic_sec()
+    for i: usize in range(iterations):
+        lmon_arena_reset(bench_arena.addr)
+        v: addr[LmonValue] = lmon_parse_json(json_sample, json_len, bench_arena.addr, err.addr)
+        sink += usize(v.type)
+    json_sec: f64 = monotonic_sec() - t1
+    if sink == 0xFFFFFFFFFFFFFFFFULL:
+        printf("")
+
+    printf("Pura LMON benchmark (%zu iterations, flat arena DOM):\n", iterations)
+    printf("  LMON (4-space): %5.1f KiB/doc -> %.3fs (%6.1f MiB/s, %5.0f docs/s)\n", f64(lmon4_len) / 1024.0, lmon4_sec, (f64(lmon4_len) * f64(iterations)) / (1048576.0 * lmon4_sec), f64(iterations) / lmon4_sec)
+    printf("  LMON (tab):     %5.1f KiB/doc -> %.3fs (%6.1f MiB/s, %5.0f docs/s)\n", f64(lmon_tab_len) / 1024.0, lmon_tab_sec, (f64(lmon_tab_len) * f64(iterations)) / (1048576.0 * lmon_tab_sec), f64(iterations) / lmon_tab_sec)
+    printf("  JSON (pretty):  %5.1f KiB/doc -> %.3fs (%6.1f MiB/s, %5.0f docs/s)\n", f64(json_len) / 1024.0, json_sec, (f64(json_len) * f64(iterations)) / (1048576.0 * json_sec), f64(iterations) / json_sec)
+    printf("  Result: LMON parsed %.2fx (4-space) / %.2fx (tab) faster per document than JSON.\n", json_sec / lmon4_sec, json_sec / lmon_tab_sec)
+
+    lmon_arena_free(bench_arena.addr)
+    free(lmon_tab_sample)
+    free(json_sample)
+    free(lmon4_sample)
+    return 0
+
+static def parse_indent_arg(arg: cstr, buf: str, buf_cap: usize) -> cstr:
+    if arg == nil or arg[0] == '\0':
+        return nil
+    if strcmp(arg, "tab") == 0 or strcmp(arg, "\\t") == 0:
+        return "\t"
+    len: usize = 0
+    if lmon_valid_indent_unit(arg, len.addr):
+        return arg
+    endptr: str = nil
+    n: usize = strtoul(arg, endptr.addr, 10)
+    if endptr != nil and val(endptr) == '\0' and n >= 1 and n < buf_cap:
+        memset(buf, ' ', n)
+        buf[n] = '\0'
+        return buf
+    return nil
+
+static def print_usage(out: addr[FILE]):
+    fprintf(out, "Usage: lmon [options] <file.lmon | ->\n")
+    fprintf(out, "Options:\n")
+    fprintf(out, "  -c, --compact          Output compact single-line JSON\n")
+    fprintf(out, "  -l, --lmon             Output canonical LMON\n")
+    fprintf(out, "  --indent <N|tab>       Set LMON output indentation in spaces or tab (default: 4)\n")
+    fprintf(out, "  --from-json            Parse input as JSON and output LMON\n")
+    fprintf(out, "  --check                Validate LMON syntax only\n")
+    fprintf(out, "  --test                 Run conformance test suite\n")
+    fprintf(out, "  --bench [file]         Run LMON vs JSON parse benchmark\n")
+
+def main(argc: i32, argv: addr[str]) -> i32:
+    if argc < 2:
+        print_usage(stdout)
+        return 1
+    for i in range(1, argc):
+        if strcmp(argv[i], "-h") == 0 or strcmp(argv[i], "--help") == 0:
+            print_usage(stdout)
+            return 0
+    if strcmp(argv[1], "--test") == 0:
+        return run_tests()
+    if strcmp(argv[1], "--bench") == 0:
+        bench_path: cstr = nil
+        if argc > 2:
+            bench_path = argv[2]
+        return run_bench(bench_path)
+
+    compact: bool = false
+    out_lmon: bool = false
+    from_json: bool = false
+    check_only: bool = false
+    indent_buf: char[256]
+    indent_unit: cstr = "    "
+    target: cstr = nil
+
+    for i: i32 = 1; i < argc; i++:
+        a: cstr = argv[i]
+        if strcmp(a, "-c") == 0 or strcmp(a, "--compact") == 0:
+            compact = true
+        elif strcmp(a, "-l") == 0 or strcmp(a, "--lmon") == 0:
+            out_lmon = true
+        elif strcmp(a, "--indent") == 0:
+            if i + 1 >= argc:
+                print_usage(stderr)
+                return 2
+            i++
+            indent_unit = parse_indent_arg(argv[i], indent_buf, sizeof(indent_buf))
+            if indent_unit == nil:
+                fprintf(stderr, "lmon error: --indent must be a positive integer or tab\n")
+                return 2
+            out_lmon = true
+        elif strcmp(a, "--from-json") == 0:
+            from_json = true
+            out_lmon = true
+        elif strcmp(a, "--check") == 0:
+            check_only = true
+        elif a[0] == '-' and a[1] != '\0':
+            fprintf(stderr, "Unknown option: %s\n", a)
+            print_usage(stderr)
+            return 2
+        else:
+            target = a
+
+    if target == nil:
+        print_usage(stderr)
+        return 2
+
+    raw_len: usize = 0
+    raw: str = nil
+    if strcmp(target, "-") == 0:
+        raw = read_stream_all(stdin, raw_len.addr)
+    else:
+        raw = read_file_all(target, raw_len.addr)
+        tlen: usize = strlen(target)
+        if tlen >= 5 and strcmp(target + tlen - 5, ".json") == 0:
+            from_json = true
+
+    if raw == nil:
+        fprintf(stderr, "lmon error: failed to read '%s': %s\n", target, strerror(errno))
+        return 1
+
+    arena: LmonArena
+    err: LmonError
+    lmon_arena_init(arena.addr, raw_len * 2 + 4096)
+
+    val: addr[LmonValue] = nil
+    if from_json:
+        val = lmon_parse_json(raw, raw_len, arena.addr, err.addr)
+    else:
+        val = lmon_parse(raw, raw_len, arena.addr, err.addr)
+
+    if val == nil:
+        msg: cstr = "parse error"
+        if err.message != nil:
+            msg = err.message
+        fprintf(stderr, "lmon error: %s: line %zu column %zu (byte %zu)\n", msg, err.line, err.col, err.pos)
+        lmon_arena_free(arena.addr)
+        free(raw)
+        return 1
+
+    if not check_only:
+        out_len: usize = 0
+        rendered: str = nil
+        if out_lmon:
+            rendered = lmon_to_lmon_indent(val, indent_unit, out_len.addr)
+        else:
+            rendered = lmon_to_json(val, not compact, out_len.addr)
+        if rendered == nil:
+            fprintf(stderr, "lmon error: out of memory while formatting output\n")
+            lmon_arena_free(arena.addr)
+            free(raw)
+            return 1
+        fwrite(rendered, 1, out_len, stdout)
+        free(rendered)
+
+    lmon_arena_free(arena.addr)
+    free(raw)
+    return 0
+
+endif

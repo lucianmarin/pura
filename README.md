@@ -18,7 +18,7 @@ Just as **LMON is JSON and JSON is LMON**, **Pura is C/C++ and C/C++ is Pura**. 
    - Indentation-delimited blocks (`:`) instead of `{` and `}` (including automatic `};` termination on `struct`, `class`, `union`, and `enum` definitions).
    - No statement-ending semicolons (`;`).
    - Python-style `def name(arg: type) -> ret_type:` functions and `name: type = value` declarations.
-   - Pythonic pointer & type ergonomics: `addr[T]` instead of `T*`, `var.addr` instead of `&var`, `val(ptr)` instead of `*ptr`, `cast(addr[T], p)` and `u8(x)` / `i32(x)` function-call type casts instead of `(u8)x`, unified `.` member access (`ptr.field` automatically emits `ptr->field`), and automatic `struct`/`enum`/`union` tag resolution without repeating `struct` or `enum`.
+   - Pythonic pointer & type ergonomics: `addr[T]` instead of `T*`, `var.addr` instead of `&var`, `val(ptr)` / `val(ptr, level)` instead of `*ptr` / `**ptr`, `cast(addr[T], p)` and `u8(x)` / `i32(x)` function-call type casts instead of `(u8)x`, unified `.` member access (`ptr.field` automatically emits `ptr->field`), and automatic `struct`/`enum`/`union` tag resolution without repeating `struct` or `enum`.
    - Pythonic keywords and logical operators (`elif`, `and`, `or`, `not`, `nil` / `None`, `self`, `pass`, `in`).
    - `#` single-line comments, `import` / `from ... import` module imports, and Python-style top-level `NAME = value` / `NAME(a, b) = expr` preprocessor definitions.
 3. **Auto-Detected Indentation & Universal Newlines:** Supports any consistent indentation unit per file (`W` spaces or `W` tabs, locked on the first indented line) and universal line endings (`\n`, `\r\n`, `\r`).
@@ -224,6 +224,7 @@ Pura replaces C's cryptic `*`, `&`, `->`, `(type)expr`, and repetitive `struct`/
 | `argv: addr[str]` | `char** argv;` | Nested pointer (`str` is `char*`, so `addr[str]` is `char**`). |
 | `var.addr` | `&var` | Address-of property (`c.addr`, `ms[i + 1].addr`). |
 | `val(ptr)` | `*ptr` | Dereference expression (`val(p) = 10`, `val(cur++) = ' '`). |
+| `val(ptr, level)` | `**ptr` _(for `level = 2`)_ | Multi-level pointer dereference (`val(argv, 2)` ↔ `**argv`, `val(p, 3)` ↔ `***p`). |
 | `u8(x)`, `i32(a + b)` | `(uint8_t)x`, `(int32_t)(a + b)` | Scalar value conversion as a function call (like `int(x)` / `float(x)` in Python). |
 | `cast(addr[Shape], ptr)` | `(struct Shape*)ptr` | Python `typing.cast(Type, val)` — used for pointer reinterpretation (`cast(addr[T], p)`) and also works for value conversions (`cast(i32, x)`). |
 | `s.width` | `s->width` _(if `s` is `addr[T]`)_ or `s.width` | Unified `.` member access — automatically emits `->` for pointers and `self`. |
@@ -488,6 +489,7 @@ See [`examples/`](examples/) for sample `.pu` programs ready to transpile or run
 - [`examples/shapes.pu`](examples/shapes.pu) — `struct`, `enum`, `addr[T]` pointers, and `switch`/`case` geometry calculator
 - [`examples/tabs.pu`](examples/tabs.pu) — Tab-indented Fibonacci calculator demonstrating auto-detected `\t` indentation and `range(2, n + 1)`
 - [`examples/cal.pu`](examples/cal.pu) — Full real-world Unix `cal` CLI utility ported from [`util-linux/misc-utils/cal.c`](https://raw.githubusercontent.com/util-linux/util-linux/refs/heads/master/misc-utils/cal.c) (Gregorian 1752 reformation, Julian `-j`, ISO/US week numbers `-w`, `-1`/`-3`/`-y`/`-Y`/`-n`/`-S`, vertical `-v`, and ANSI highlight)
+- [`examples/lmon.pu`](examples/lmon.pu) — Full LMON (Lightweight Markup Object Notation) & RFC 8259 JSON parser, canonical serializer, 104-test conformance suite, and throughput benchmark (`LmonArena` bump allocator, flat contiguous DOM, and optional ARM NEON SIMD string scanner)
 
 ---
 

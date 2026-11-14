@@ -507,22 +507,74 @@ static void translate_tokens_pura_to_c(PuraBuf *out, const char *s, size_t len) 
                 }
             }
 
-            /* `val(p)` -> `*p` */
+            /* `val(p)` -> `*p` and `val(p, level)` -> `**...*p` */
             if (!is_member && wlen == 3 && memcmp(s + start, "val", 3) == 0 &&
                 i < len && s[i] == '(') {
                 size_t close_p = find_matching_paren(s, len, i);
                 if (close_p < len) {
                     const char *inner = s + i + 1;
                     size_t inner_len = close_p - (i + 1);
-                    pura_buf_putc(out, '*');
-                    bool simple_postfix = true;
-                    int pdepth = 0;
+                    size_t comma = inner_len;
+                    int cdepth = 0;
+                    char cquote = 0;
                     for (size_t k = 0; k < inner_len; k++) {
                         char ic = inner[k];
+                        if (cquote) {
+                            if (ic == '\\' && k + 1 < inner_len) k++;
+                            else if (ic == cquote) cquote = 0;
+                        } else {
+                            if (ic == '"' || ic == '\'') cquote = ic;
+                            else if (ic == '(' || ic == '[' || ic == '<') cdepth++;
+                            else if (ic == ')' || ic == ']' || ic == '>') cdepth--;
+                            else if (ic == ',' && cdepth == 0) {
+                                comma = k;
+                                break;
+                            }
+                        }
+                    }
+
+                    const char *expr_s = inner;
+                    size_t expr_len = inner_len;
+                    size_t deref_level = 1;
+                    if (comma < inner_len) {
+                        expr_len = comma;
+                        while (expr_len > 0 && expr_s[0] == ' ') { expr_s++; expr_len--; }
+                        while (expr_len > 0 && expr_s[expr_len - 1] == ' ') expr_len--;
+
+                        const char *lvl_s = inner + comma + 1;
+                        size_t lvl_len = inner_len - (comma + 1);
+                        while (lvl_len > 0 && lvl_s[0] == ' ') { lvl_s++; lvl_len--; }
+                        while (lvl_len > 0 && lvl_s[lvl_len - 1] == ' ') lvl_len--;
+
+                        if (lvl_len > 0) {
+                            size_t parsed = 0;
+                            bool all_digits = true;
+                            for (size_t k = 0; k < lvl_len; k++) {
+                                if (lvl_s[k] >= '0' && lvl_s[k] <= '9') {
+                                    parsed = parsed * 10 + (size_t)(lvl_s[k] - '0');
+                                } else {
+                                    all_digits = false;
+                                    break;
+                                }
+                            }
+                            if (all_digits && parsed > 0 && parsed <= 16) {
+                                deref_level = parsed;
+                            }
+                        }
+                    }
+
+                    for (size_t d = 0; d < deref_level; d++) {
+                        pura_buf_putc(out, '*');
+                    }
+
+                    bool simple_postfix = true;
+                    int pdepth = 0;
+                    for (size_t k = 0; k < expr_len; k++) {
+                        char ic = expr_s[k];
                         if (ic == '[' || ic == '(') pdepth++;
                         else if (ic == ']' || ic == ')') pdepth--;
                         else if (pdepth == 0 && (ic == ' ' || ic == '+' || ic == '-' || ic == '*' || ic == '/')) {
-                            if ((ic == '+' || ic == '-') && k + 2 == inner_len && inner[k + 1] == ic) {
+                            if ((ic == '+' || ic == '-') && k + 2 == expr_len && expr_s[k + 1] == ic) {
                                 continue;
                             }
                             simple_postfix = false;
@@ -530,10 +582,10 @@ static void translate_tokens_pura_to_c(PuraBuf *out, const char *s, size_t len) 
                         }
                     }
                     if (simple_postfix) {
-                        translate_tokens_pura_to_c(out, inner, inner_len);
+                        translate_tokens_pura_to_c(out, expr_s, expr_len);
                     } else {
                         pura_buf_putc(out, '(');
-                        translate_tokens_pura_to_c(out, inner, inner_len);
+                        translate_tokens_pura_to_c(out, expr_s, expr_len);
                         pura_buf_putc(out, ')');
                     }
                     i = close_p + 1;
@@ -836,16 +888,31 @@ static void translate_tokens_c_to_pura(PuraBuf *out, const char *s, size_t len) 
                 continue;
             }
         }
-        /* Unary dereference `*expr` -> `val(expr)` */
-        if (c == '*' && (i + 1 < len && s[i + 1] != '=' && s[i + 1] != ' ' && s[i + 1] != ')') &&
-            is_c_unary_prefix_pos(s, i)) {
-            size_t op_end = scan_c_unary_operand(s, len, i + 1);
-            if (op_end > i + 1) {
-                pura_buf_puts(out, "val(");
-                translate_tokens_c_to_pura(out, s + i + 1, op_end - (i + 1));
-                pura_buf_putc(out, ')');
-                i = op_end;
-                continue;
+        /* Unary dereference `*expr` -> `val(expr)` and `**expr` -> `val(expr, 2)` */
+        if (c == '*' && is_c_unary_prefix_pos(s, i)) {
+            size_t stars = 0;
+            while (i + stars < len && s[i + stars] == '*') stars++;
+            if (i + stars < len && s[i + stars] != '=' && s[i + stars] != ' ' && s[i + stars] != ')') {
+                size_t op_end = scan_c_unary_operand(s, len, i + stars);
+                if (op_end > i + stars) {
+                    const char *op_s = s + i + stars;
+                    size_t op_len = op_end - (i + stars);
+                    if (op_len >= 2 && op_s[0] == '(' && find_matching_paren(op_s, op_len, 0) == op_len - 1) {
+                        op_s++;
+                        op_len -= 2;
+                    }
+                    pura_buf_puts(out, "val(");
+                    translate_tokens_c_to_pura(out, op_s, op_len);
+                    if (stars > 1) {
+                        char lvl_buf[24];
+                        snprintf(lvl_buf, sizeof(lvl_buf), ", %zu)", stars);
+                        pura_buf_puts(out, lvl_buf);
+                    } else {
+                        pura_buf_putc(out, ')');
+                    }
+                    i = op_end;
+                    continue;
+                }
             }
         }
         if (c == '|' && i + 1 < len && s[i + 1] == '|') {
@@ -2018,7 +2085,7 @@ char *pura_to_c(const char *src, size_t len, PuraError *err, size_t *out_len) {
             continue;
         }
 
-        /* Function prototype without body: `def foo(a: i32) -> i32` */
+        /* Function prototype without body: `[static|inline] def foo(a: i32) -> i32` */
         if (starts_with_kw(content, code_len, "def", &kw_after) ||
             starts_with_kw(content, code_len, "fn", &kw_after)) {
             if (!emit_pura_function_def(&out, NULL, content + kw_after, code_len - kw_after, false, level + 1)) {
@@ -2032,6 +2099,44 @@ char *pura_to_c(const char *src, size_t len, PuraError *err, size_t *out_len) {
             }
             pura_buf_putc(&out, '\n');
             continue;
+        }
+        if (starts_with_kw(content, code_len, "static inline def", &kw_after) ||
+            starts_with_kw(content, code_len, "static def", &kw_after) ||
+            starts_with_kw(content, code_len, "inline def", &kw_after)) {
+            char qual[32];
+            size_t qlen = kw_after;
+            while (qlen > 0 && content[qlen - 1] == ' ') qlen--;
+            if (qlen >= 4 && memcmp(content + qlen - 4, " def", 4) == 0) {
+                qlen -= 4;
+            }
+            memcpy(qual, content, qlen);
+            qual[qlen] = '\0';
+            if (!emit_pura_function_def(&out, qual, content + kw_after, code_len - kw_after, false, level + 1)) {
+                if (err) { err->message = "invalid qualified function prototype"; err->line = line_no; err->col = 1; }
+                pura_buf_free(&out);
+                return NULL;
+            }
+            if (inline_comment) {
+                pura_buf_puts(&out, " //");
+                pura_buf_append(&out, inline_comment + 1, (size_t)(content + clen - (inline_comment + 1)));
+            }
+            pura_buf_putc(&out, '\n');
+            continue;
+        }
+
+        /* Forward tag declaration without body: `struct Foo` or `union Foo` */
+        if (starts_with_kw(content, code_len, "struct", &kw_after) ||
+            starts_with_kw(content, code_len, "union", &kw_after)) {
+            const char *tag = content + kw_after;
+            size_t tlen = code_len - kw_after;
+            while (tlen > 0 && tag[tlen - 1] == ' ') tlen--;
+            bool simple_tag = (tlen > 0);
+            for (size_t k = 0; k < tlen; k++) {
+                if (!is_ident_cont(tag[k])) { simple_tag = false; break; }
+            }
+            if (simple_tag) {
+                symtab_add_tag(content[0] == 's' ? "struct" : "union", tag, tlen);
+            }
         }
 
         /* Type alias: `type Name = TargetType` -> `typedef TargetType Name;` */
@@ -2942,13 +3047,13 @@ static int run_tests(void) {
         "    printf(\"total=%d\\n\", total)\n"
         "    return 0\n",
 
-        /* Tab-indented with switch/case, pointers, and enum */
+        /* Tab-indented with switch/case, pointers, multi-level deref val(ptr, level), and enum */
         "import stdint.h\n"
         "enum Status:\n"
         "\tOK = 0\n"
         "\tERR = 1\n"
-        "def check(msg: cstr, out_code: addr[i32], code: i32) -> bool:\n"
-        "\tif msg == nil or code != 0:\n"
+        "def check(argv: addr[cstr], out_code: addr[i32], code: i32) -> bool:\n"
+        "\tif argv == nil or val(argv, 2) == '\\0' or code != 0:\n"
         "\t\tval(out_code) = ERR\n"
         "\t\treturn false\n"
         "\tswitch code:\n"
