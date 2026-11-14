@@ -1,0 +1,16 @@
+# Built binaries
+/pura
+/shapes
+/hello
+/tabs
+/cal
+/lmon
+
+# C/C++ build artifacts
+*.o
+*.out
+*.exe
+*.dSYM/
+
+# OS / Editor files
+.DS_Store

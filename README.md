@@ -455,7 +455,10 @@ c_header_file  = path_stem "." ( "h" | "c" | "hpp" ) ; (* Explicit extension: re
 
 ```sh
 # Build the pura binary
-cc -O3 -std=c11 -Wall -Wextra pura.c -o pura
+make
+
+# Install to Homebrew prefix (or /usr/local/bin)
+make install
 
 # Transpile a .pu file to C/C++ on stdout
 ./pura examples/hello.pu
