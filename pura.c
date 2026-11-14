@@ -6,21 +6,21 @@
  *   - Pythonic indentation (`:` blocks instead of `{` `}`, no trailing `;` noise)
  *   - Pythonic declarations (`def fn(a: i32) -> i32:`, `x: i32 = 10`)
  *   - Pythonic keywords & operators (`elif`, `and`, `or`, `not`, `nil`, `pass`)
- *   - Bracket-free `import`: extensionless `import module` for `.pu` modules, `import stdio.h` for `.h`/`.c` files
+ *   - Bracket-free `import`: extensionless `import module` for `.pura` modules, `import stdio.h` for `.h`/`.c` files
  *   - Concise fixed-width & C/C++ type aliases (`i8`..`i64`, `u8`..`u64`, `f32`, `f64`, `usize`, `isize`, `str`, `cstr`, `byte`)
  *   - Auto-detected indentation (any consistent spaces or tabs) & universal newlines (\n, \r\n, \r)
  *   - Embeddable as a library (#define PURA_NO_MAIN before including/compiling)
  *
  * Build & CLI usage:
  *   cc -O3 -std=c11 -Wall -Wextra pura.c -o pura
- *   ./pura examples/hello.pu
- *   ./pura --pura [--indent <N|tab>] examples/hello.pu
+ *   ./pura examples/hello.pura
+ *   ./pura --pura [--indent <N|tab>] examples/hello.pura
  *   ./pura --from-c examples/hello.c
- *   ./pura --compile examples/hello.pu -o hello
- *   ./pura --run examples/hello.pu
- *   ./pura --check examples/hello.pu
+ *   ./pura --compile examples/hello.pura -o hello
+ *   ./pura --run examples/hello.pura
+ *   ./pura --check examples/hello.pura
  *   ./pura --test
- *   ./pura --bench [file.pu]
+ *   ./pura --bench [file.pura]
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -2172,7 +2172,7 @@ char *pura_to_c(const char *src, size_t len, PuraError *err, size_t *out_len) {
 
         /* Preprocessor & module imports:
          *   - Extensionless (`import math_utils` or `from math_utils import ...`):
-         *     Imports a Pura `.pu` module -> `#include "math_utils.h"`
+         *     Imports a Pura `.pura` module -> `#include "math_utils.h"`
          *   - With `.h`/`.c`/`.hpp` extension (`import stdio.h`, `import "my.h"`):
          *     Imports an untranspiled C/C++ header or source file directly (`#include <stdio.h>` or `#include "my.h"`).
          *   - `define NAME val` -> `#define NAME val`
@@ -2190,7 +2190,7 @@ char *pura_to_c(const char *src, size_t len, PuraError *err, size_t *out_len) {
                 pura_buf_append(&out, imp, ilen);
                 pura_buf_putc(&out, '>');
             } else {
-                /* Extensionless: Pura .pu module (transpiled to local "module.h") */
+                /* Extensionless: Pura .pura module (transpiled to local "module.h") */
                 pura_buf_putc(&out, '"');
                 for (size_t k = 0; k < ilen; k++) {
                     pura_buf_putc(&out, imp[k]);
@@ -3494,7 +3494,7 @@ char *pura_from_c_indent(const char *src, size_t len, const char *indent_unit,
                     pura_buf_append(&out, inc + 1, ilen - 2);
                 } else if (ilen > 4 && inc[0] == '"' && inc[ilen - 1] == '"' &&
                            memcmp(inc + ilen - 3, ".h\"", 3) == 0) {
-                    /* `#include "math_utils.h"` -> `import math_utils` (Pura .pu module) */
+                    /* `#include "math_utils.h"` -> `import math_utils` (Pura .pura module) */
                     pura_buf_append(&out, inc + 1, ilen - 4);
                 } else {
                     pura_buf_append(&out, inc, ilen);
@@ -4152,14 +4152,14 @@ static int run_bench(const char *path) {
 static void print_usage(const char *prog) {
     fprintf(stderr,
         "Usage:\n"
-        "  %s <file.pu>                         Transpile Pura to C/C++ on stdout\n"
+        "  %s <file.pura>                       Transpile Pura to C/C++ on stdout\n"
         "  %s --pura [--indent <N|tab>] <f>   Format/canonicalize Pura\n"
         "  %s --from-c [--indent <N|tab>] <f>   Convert C/C++ source to Pura\n"
-        "  %s --compile <file.pu> [-o <bin>]    Transpile and compile via cc/c++\n"
-        "  %s --run <file.pu>                   Transpile, compile, and execute immediately\n"
-        "  %s --check <file.pu>                 Validate Pura syntax only\n"
+        "  %s --compile <file.pura> [-o <bin>]  Transpile and compile via cc/c++\n"
+        "  %s --run <file.pura>                 Transpile, compile, and execute immediately\n"
+        "  %s --check <file.pura>               Validate Pura syntax only\n"
         "  %s --test                            Run built-in conformance test suite\n"
-        "  %s --bench [file.pu]                 Run transpilation throughput benchmark\n",
+        "  %s --bench [file.pura]               Run transpilation throughput benchmark\n",
         prog, prog, prog, prog, prog, prog, prog, prog
     );
 }

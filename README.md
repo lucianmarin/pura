@@ -4,7 +4,7 @@
 
 Just as **LMON is JSON and JSON is LMON**, **Pura is C/C++ and C/C++ is Pura**. Every Pura construct maps directly and deterministically to an exact C/C++ equivalent—with **no curly braces (`{` `}`) for blocks**, **no trailing semicolons (`;`)**, **Pythonic function and variable type annotations (`def`, `name: type -> ret`)**, **concise fixed-width type aliases (`i8`..`i64`, `u8`..`u64`, `f32`, `f64`, `usize`, `cstr`, `str`)**, and **zero runtime or ABI overhead**.
 
-- **Extension:** `.pu` (or `.pura`)
+- **Extension:** `.pura`
 - **Target Languages:** ISO C11 / C17 / C23 and ISO C++17 / C++20
 - **Encoding:** UTF-8 (without BOM)
 
@@ -27,7 +27,7 @@ Just as **LMON is JSON and JSON is LMON**, **Pura is C/C++ and C/C++ is Pura**. 
 
 ## Side-by-Side Comparison
 
-### Pura (`.pu`)
+### Pura (`.pura`)
 
 ```python
 # Service node evaluator in Pura
@@ -138,16 +138,16 @@ int32_t main(void) {
 
 Because Pura uses `#` for Python-style comments, C preprocessor directives are expressed as clean, bracket-free keywords at the start of a line.
 
-In particular, `import` distinguishes between **Pura modules (`.pu`)** and **untranspiled C/C++ files (`.h` / `.c` / `.hpp`)** by whether a file extension is present:
+In particular, `import` distinguishes between **Pura modules (`.pura`)** and **untranspiled C/C++ files (`.h` / `.c` / `.hpp`)** by whether a file extension is present:
 
-- **Without an extension (`import math_utils`):** Refers to a Pura `.pu` module (`math_utils.pu`), transpiling to `#include "math_utils.h"`.
+- **Without an extension (`import math_utils`):** Refers to a Pura `.pura` module (`math_utils.pura`), transpiling to `#include "math_utils.h"`.
 - **With an explicit `.h` or `.c` extension (`import stdio.h`):** Imports an untranspiled C/C++ header or source file directly (`#include <stdio.h>`).
 
 | Pura Syntax | C / C++ Equivalent | Notes |
 | :--- | :--- | :--- |
 | `# comment text` | `// comment text` | Full-line or inline comment (preceded by space outside quotes). |
-| `import math_utils` | `#include "math_utils.h"` | Extensionless `import` is exclusively for Pura `.pu` modules. |
-| `from math_utils import *` | `#include "math_utils.h"` | Python-style `from` import of a Pura `.pu` module. |
+| `import math_utils` | `#include "math_utils.h"` | Extensionless `import` is exclusively for Pura `.pura` modules. |
+| `from math_utils import *` | `#include "math_utils.h"` | Python-style `from` import of a Pura `.pura` module. |
 | `import stdio.h` | `#include <stdio.h>` | Explicit `.h` / `.c` extension imports an untranspiled C/C++ file directly. |
 | `import sys/stat.h` | `#include <sys/stat.h>` | Explicit path with `.h` extension imports system header directly. |
 | `import "vendor.c"` | `#include "vendor.c"` | Quoted `.h` or `.c` path imports a local untranspiled C file directly. |
@@ -457,7 +457,7 @@ directive_line = ( "import" ( pura_module | c_header_file )
                  | ( "ifdef" | "ifndef" | "pragma" ) rest_of_line
                  | "endif" ) EOL ;
 macro_assign   = ident [ "(" [ ident_list ] ")" ] "=" expr ; (* Top-level untyped `=` -> #define *)
-pura_module    = ident ;                       (* Extensionless: resolves to .pu module -> "ident.h" *)
+pura_module    = ident ;                       (* Extensionless: resolves to .pura module -> "ident.h" *)
 c_header_file  = path_stem "." ( "h" | "c" | "hpp" ) ; (* Explicit extension: resolves to <path.h> *)
 ```
 
@@ -476,25 +476,25 @@ make
 # Install to Homebrew prefix (or /usr/local/bin)
 make install
 
-# Transpile a .pu file to C/C++ on stdout
-./pura examples/hello.pu
+# Transpile a .pura file to C/C++ on stdout
+./pura examples/hello.pura
 
 # Transpile, compile with cc, and run immediately
-./pura --run examples/hello.pu
+./pura --run examples/hello.pura
 
-# Compile a .pu file directly to a native binary
-./pura --compile examples/shapes.pu -o shapes && ./shapes
+# Compile a .pura file directly to a native binary
+./pura --compile examples/shapes.pura -o shapes && ./shapes
 
 # Format/canonicalize Pura (default 4 spaces, or any N spaces / tab)
-./pura --pura examples/hello.pu
-./pura --pura --indent tab examples/hello.pu
+./pura --pura examples/hello.pura
+./pura --pura --indent tab examples/hello.pura
 
 # Convert existing C/C++ source code into Pura
 ./pura --from-c input.c
 ./pura --from-c --indent tab input.c
 
 # Validate Pura syntax & indentation rules only
-./pura --check examples/hello.pu
+./pura --check examples/hello.pura
 
 # Run built-in conformance tests & throughput benchmark
 ./pura --test && ./pura --bench
@@ -502,13 +502,13 @@ make install
 
 ### Examples Directory
 
-See [`examples/`](examples/) for sample `.pu` programs ready to transpile or run:
+See [`examples/`](examples/) for sample `.pura` programs ready to transpile or run:
 
-- [`examples/hello.pu`](examples/hello.pu) — Minimal introduction to Pura types, `def` functions, `range()` loops, and `and`/`or`/`not`
-- [`examples/shapes.pu`](examples/shapes.pu) — `struct`, `enum`, `addr[T]` pointers, and `switch`/`case` geometry calculator
-- [`examples/tabs.pu`](examples/tabs.pu) — Tab-indented Fibonacci calculator demonstrating auto-detected `\t` indentation and `range(2, n + 1)`
-- [`examples/cal.pu`](examples/cal.pu) — Full real-world Unix `cal` CLI utility ported from [`util-linux/misc-utils/cal.c`](https://raw.githubusercontent.com/util-linux/util-linux/refs/heads/master/misc-utils/cal.c) (Gregorian 1752 reformation, Julian `-j`, ISO/US week numbers `-w`, `-1`/`-3`/`-y`/`-Y`/`-n`/`-S`, vertical `-v`, and ANSI highlight)
-- [`examples/lmon.pu`](examples/lmon.pu) — Full LMON (Lightweight Markup Object Notation) & RFC 8259 JSON parser, canonical serializer, 104-test conformance suite, and throughput benchmark (`LmonArena` bump allocator, flat contiguous DOM, and optional ARM NEON SIMD string scanner)
+- [`examples/hello.pura`](examples/hello.pura) — Minimal introduction to Pura types, `def` functions, `range()` loops, and `and`/`or`/`not`
+- [`examples/shapes.pura`](examples/shapes.pura) — `struct`, `enum`, `addr[T]` pointers, and `switch`/`case` geometry calculator
+- [`examples/tabs.pura`](examples/tabs.pura) — Tab-indented Fibonacci calculator demonstrating auto-detected `\t` indentation and `range(2, n + 1)`
+- [`examples/cal.pura`](examples/cal.pura) — Full real-world Unix `cal` CLI utility ported from [`util-linux/misc-utils/cal.c`](https://raw.githubusercontent.com/util-linux/util-linux/refs/heads/master/misc-utils/cal.c) (Gregorian 1752 reformation, Julian `-j`, ISO/US week numbers `-w`, `-1`/`-3`/`-y`/`-Y`/`-n`/`-S`, vertical `-v`, and ANSI highlight)
+- [`examples/lmon.pura`](examples/lmon.pura) — Full LMON (Lightweight Markup Object Notation) & RFC 8259 JSON parser, canonical serializer, 104-test conformance suite, and throughput benchmark (`LmonArena` bump allocator, flat contiguous DOM, and optional ARM NEON SIMD string scanner)
 
 ---
 
@@ -516,7 +516,7 @@ See [`examples/`](examples/) for sample `.pu` programs ready to transpile or run
 
 Measured on macOS (`Clang -O3`) across a 250-function systems module (`Node` structs, pointer arithmetic, loops, and multi-branch conditionals):
 
-| Metric | 4-Space Pura (`.pu`) | Tab `\t` Pura (`.pu`) | Equivalent C (`.c`) |
+| Metric | 4-Space Pura (`.pura`) | Tab `\t` Pura (`.pura`) | Equivalent C (`.c`) |
 | :--- | :--- | :--- | :--- |
 | **Source Payload Size** | **`83.2 KiB`** (`-9.8%` vs C) | **`70.0 KiB`** (**`-24.1%`** vs C) | `92.2 KiB` (`94,435` bytes) |
 | **Pura → C Speed** | **`2,772 files/s`** (`225.1 MiB/s`) | **`3,155 files/s`** (`215.6 MiB/s`) | — |

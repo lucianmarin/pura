@@ -8,9 +8,9 @@
 #   - Embeddable as a library (define LMON_NO_MAIN before compiling)
 #
 # Build & CLI usage with Pura:
-#   ./pura --compile examples/lmon.pu -o lmon_pu
-#   ./lmon_pu --test
-#   ./lmon_pu --bench
+#   ./pura --compile examples/lmon.pura -o lmon_pura
+#   ./lmon_pura --test
+#   ./lmon_pura --bench
 
 import ctype.h
 import errno.h
