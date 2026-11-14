@@ -176,6 +176,11 @@ Pura provides concise, unambiguous primitive type names alongside all standard C
 | `cstr` | `const char*` | Immutable NUL-terminated C string pointer. |
 | `str` | `char*` | Mutable NUL-terminated C string pointer. |
 | `any` | `void*` | Generic untyped pointer. |
+| `list[T]` | `std::vector<T>` | C++ dynamic list / vector container. |
+| `set[T]` | `std::set<T>` | C++ ordered set container. |
+| `unordered_set[T]` | `std::unordered_set<T>` | C++11 hash set container. |
+| `dict[K, V]` | `std::map<K, V>` | C++ ordered key-value map container. |
+| `unordered_map[K, V]` | `std::unordered_map<K, V>` | C++11 hash map container. |
 
 ---
 
@@ -330,10 +335,22 @@ Parentheses around `if`, `elif`, `while`, `for`, and `switch` conditions are omi
    - **Typed loop variable (`for i: usize in range(len):`):**
      ↔ `for (size_t i = 0; i < len; i++) {`
    - **C++ iterable range (`for item in vec:`):**
-     → `for (auto item : vec) {`
+     ↔ `for (auto item : vec) {`
    - **Classic 3-clause C loop (`for m: addr[cal_month] = month; m != nil; m = m.next:`):**
      ↔ `for (struct cal_month* m = month; m != NULL; m = m->next) {`
-3. **`while` and `do` / `while` Loops:**
+3. **List, Set, and Dict Comprehensions (C Fixed-Size Arrays & C++ Containers):**
+   Comprehensions in variable declarations map bijectively between Pythonic `[...]` / `{...}` syntax and zero-overhead C11 array/table initialization loops or C++ STL container loops (with optional `if` filter clauses):
+
+   | Comprehension Form | Pura Syntax | C11 / C++ Equivalent |
+   | :--- | :--- | :--- |
+   | **C List (`T[N]`)** | `sq: i32[8] = [i * i for i in range(8)]` | `int32_t sq[8]; for (int32_t i = 0; i < 8; i++) { sq[i] = i * i; }` |
+   | **C Set (`bool[N]`)** | `evens: bool[16] = {i for i in range(16) if i % 2 == 0}` | `bool evens[16] = {0}; for (int32_t i = 0; i < 16; i++) { if (i % 2 == 0) { evens[i] = true; } }` |
+   | **C Dict (`T[N]`)** | `tbl: i32[8] = {i: i * 10 for i in range(8) if i > 0}` | `int32_t tbl[8] = {0}; for (int32_t i = 0; i < 8; i++) { if (i > 0) { tbl[i] = i * 10; } }` |
+   | **C++ List (`list[T]`)** | `vec: list[i32] = [x * 2 for x in sq if x > 0]` | `std::vector<int32_t> vec; for (auto x : sq) { if (x > 0) { vec.push_back(x * 2); } }` |
+   | **C++ Set (`set[T]` / `unordered_set[T]`)** | `uniq: set[i32] = {x for x in vec}` | `std::set<int32_t> uniq; for (auto x : vec) { uniq.insert(x); }` |
+   | **C++ Dict (`dict[K, V]` / `unordered_map[K, V]`)** | `m: dict[i32, i32] = {x: x + 1 for x in uniq}` | `std::map<int32_t, int32_t> m; for (auto x : uniq) { m[x] = x + 1; }` |
+
+4. **`while` and `do` / `while` Loops:**
    ```python
    while count > 0:
        count -= 1
@@ -342,7 +359,7 @@ Parentheses around `if`, `elif`, `while`, `for`, and `switch` conditions are omi
        attempt += 1
    while attempt < 3
    ```
-4. **`switch` / `match` and `case` / `default`:**
+5. **`switch` / `match` and `case` / `default`:**
    ```python
    switch kind:
        case 0:

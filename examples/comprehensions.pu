@@ -1,0 +1,38 @@
+# List, Set (unordered_set / set), and Dict (unordered_map / dict) comprehensions in Pura
+
+import stdio.h
+import stdint.h
+import stdbool.h
+import vector
+import set
+import unordered_set
+import map
+import unordered_map
+
+def main() -> i32:
+    # 1. List comprehensions -> C++ std::vector<int32_t> (`list[i32]`) and C fixed array (`i32[N]`)
+    squares: list[i32] = [x * x for x in range(1, 7) if x % 2 == 0]
+    c_squares: i32[4] = [i * i for i in range(4)]
+    printf("List (std::vector): [")
+    for x in squares:
+        printf(" %d", x)
+    printf(" ] | C array[3]=%d\n", c_squares[3])
+
+    # 2. Set comprehensions -> C++11 std::unordered_set (`unordered_set[i32]`), std::set (`set[i32]`), and C bitset (`bool[N]`)
+    hash_set: unordered_set[i32] = {x % 4 for x in range(10)}
+    btree_set: set[i32] = {x % 4 for x in range(10)}
+    c_set: bool[8] = {x for x in range(8) if x % 2 == 0}
+    printf("unordered_set (count=%zu) | set (sorted):", hash_set.size())
+    for x in btree_set:
+        printf(" %d", x)
+    printf(" | c_set[4]=%d\n", i32(c_set[4]))
+
+    # 3. Dict comprehensions -> C++11 std::unordered_map (`unordered_map[K, V]`), std::map (`dict[K, V]`), and C table (`i32[N]`)
+    hash_map: unordered_map[i32, i32] = {x: x * 10 for x in squares if x > 0}
+    btree_map: dict[i32, i32] = {x: x * 2 for x in squares if x > 0}
+    c_table: i32[8] = {i: i * 100 for i in range(8) if i > 0}
+    printf("unordered_map (count=%zu) | map (sorted):", hash_map.size())
+    for kv in btree_map:
+        printf(" %d:%d", kv.first, kv.second)
+    printf(" | c_table[3]=%d\n", c_table[3])
+    return 0

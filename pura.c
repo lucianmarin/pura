@@ -278,47 +278,6 @@ static const char *map_c_word_to_pura(const char *w, size_t len) {
 
 static void translate_tokens_pura_to_c(PuraBuf *out, const char *s, size_t len);
 
-/* Translate a Pura type specification (supporting `addr[T]` and automatic `struct`/`enum`/`union` prefix) to C */
-static void translate_type_pura_to_c(PuraBuf *out, const char *s, size_t len) {
-    while (len > 0 && s[0] == ' ') { s++; len--; }
-    while (len > 0 && s[len - 1] == ' ') len--;
-    if (len == 0) return;
-
-    /* `addr[T]` -> `<C type of T>*` */
-    if (len >= 6 && memcmp(s, "addr[", 5) == 0 && s[len - 1] == ']') {
-        translate_type_pura_to_c(out, s + 5, len - 6);
-        pura_buf_putc(out, '*');
-        return;
-    }
-
-    /* Check leading `const ` */
-    if (len > 6 && memcmp(s, "const ", 6) == 0) {
-        pura_buf_puts(out, "const ");
-        translate_type_pura_to_c(out, s + 6, len - 6);
-        return;
-    }
-
-    /* Ifalready prefixed with `struct `, `enum `, `union `, translate tokens directly */
-    if ((len > 7 && memcmp(s, "struct ", 7) == 0) ||
-        (len > 5 && memcmp(s, "enum ", 5) == 0) ||
-        (len > 6 && memcmp(s, "union ", 6) == 0)) {
-        translate_tokens_pura_to_c(out, s, len);
-        return;
-    }
-
-    /* Check if base identifier is a registered struct/enum/union tag */
-    size_t id_len = 0;
-    while (id_len < len && is_ident_cont(s[id_len])) id_len++;
-    if (id_len > 0) {
-        const char *tag_kind = symtab_find_tag_kind(s, id_len);
-        if (tag_kind) {
-            pura_buf_puts(out, tag_kind);
-            pura_buf_putc(out, ' ');
-        }
-    }
-    translate_tokens_pura_to_c(out, s, len);
-}
-
 /* Find matching closing `)` for `(` at `open_idx` */
 static size_t find_matching_paren(const char *s, size_t len, size_t open_idx) {
     int depth = 0;
@@ -338,6 +297,148 @@ static size_t find_matching_paren(const char *s, size_t len, size_t open_idx) {
         }
     }
     return len;
+}
+
+/* Find matching closing bracket/brace/angle `close_ch` for `open_ch` at `open_idx` */
+static size_t find_matching_delim(const char *s, size_t len, size_t open_idx, char open_ch, char close_ch) {
+    int depth = 0;
+    char quote = 0;
+    for (size_t i = open_idx; i < len; i++) {
+        char c = s[i];
+        if (quote) {
+            if (c == '\\' && i + 1 < len) i++;
+            else if (c == quote) quote = 0;
+            continue;
+        }
+        if (c == '"' || c == '\'') quote = c;
+        else if (c == open_ch) depth++;
+        else if (c == close_ch) {
+            depth--;
+            if (depth == 0) return i;
+        }
+    }
+    return len;
+}
+
+/* Find top-level comma inside a slice (respecting (), [], <>) */
+static size_t find_top_level_comma(const char *s, size_t len) {
+    int depth = 0;
+    char quote = 0;
+    for (size_t i = 0; i < len; i++) {
+        char c = s[i];
+        if (quote) {
+            if (c == '\\' && i + 1 < len) i++;
+            else if (c == quote) quote = 0;
+            continue;
+        }
+        if (c == '"' || c == '\'') quote = c;
+        else if (c == '(' || c == '[' || c == '<' || c == '{') depth++;
+        else if (c == ')' || c == ']' || c == '>' || c == '}') depth--;
+        else if (c == ',' && depth == 0) return i;
+    }
+    return len;
+}
+
+/* Translate a Pura type specification (supporting `addr[T]`, `list[T]`, `set[T]`, `dict[K, V]`,
+   and automatic `struct`/`enum`/`union` prefix) to C/C++ */
+static void translate_type_pura_to_c(PuraBuf *out, const char *s, size_t len) {
+    while (len > 0 && s[0] == ' ') { s++; len--; }
+    while (len > 0 && s[len - 1] == ' ') len--;
+    if (len == 0) return;
+
+    /* Check leading `const ` */
+    if (len > 6 && memcmp(s, "const ", 6) == 0) {
+        pura_buf_puts(out, "const ");
+        translate_type_pura_to_c(out, s + 6, len - 6);
+        return;
+    }
+
+    /* `addr[T]` -> `<C type of T>*` */
+    if (len >= 6 && memcmp(s, "addr[", 5) == 0 &&
+        find_matching_delim(s, len, 4, '[', ']') == len - 1) {
+        translate_type_pura_to_c(out, s + 5, len - 6);
+        pura_buf_putc(out, '*');
+        return;
+    }
+
+    /* `list[T]` -> `std::vector<T>` */
+    if (len >= 6 && memcmp(s, "list[", 5) == 0 &&
+        find_matching_delim(s, len, 4, '[', ']') == len - 1) {
+        pura_buf_puts(out, "std::vector<");
+        translate_type_pura_to_c(out, s + 5, len - 6);
+        pura_buf_putc(out, '>');
+        return;
+    }
+
+    /* `set[T]` -> `std::set<T>` */
+    if (len >= 5 && memcmp(s, "set[", 4) == 0 &&
+        find_matching_delim(s, len, 3, '[', ']') == len - 1) {
+        pura_buf_puts(out, "std::set<");
+        translate_type_pura_to_c(out, s + 4, len - 5);
+        pura_buf_putc(out, '>');
+        return;
+    }
+
+    /* `unordered_set[T]` -> `std::unordered_set<T>` */
+    if (len >= 15 && memcmp(s, "unordered_set[", 14) == 0 &&
+        find_matching_delim(s, len, 13, '[', ']') == len - 1) {
+        pura_buf_puts(out, "std::unordered_set<");
+        translate_type_pura_to_c(out, s + 14, len - 15);
+        pura_buf_putc(out, '>');
+        return;
+    }
+
+    /* `dict[K, V]` -> `std::map<K, V>` */
+    if (len >= 8 && memcmp(s, "dict[", 5) == 0 &&
+        find_matching_delim(s, len, 4, '[', ']') == len - 1) {
+        const char *inner = s + 5;
+        size_t inner_len = len - 6;
+        size_t comma = find_top_level_comma(inner, inner_len);
+        if (comma < inner_len) {
+            pura_buf_puts(out, "std::map<");
+            translate_type_pura_to_c(out, inner, comma);
+            pura_buf_puts(out, ", ");
+            translate_type_pura_to_c(out, inner + comma + 1, inner_len - comma - 1);
+            pura_buf_putc(out, '>');
+            return;
+        }
+    }
+
+    /* `unordered_map[K, V]` -> `std::unordered_map<K, V>` */
+    if (len >= 17 && memcmp(s, "unordered_map[", 14) == 0 &&
+        find_matching_delim(s, len, 13, '[', ']') == len - 1) {
+        const char *inner = s + 14;
+        size_t inner_len = len - 15;
+        size_t comma = find_top_level_comma(inner, inner_len);
+        if (comma < inner_len) {
+            pura_buf_puts(out, "std::unordered_map<");
+            translate_type_pura_to_c(out, inner, comma);
+            pura_buf_puts(out, ", ");
+            translate_type_pura_to_c(out, inner + comma + 1, inner_len - comma - 1);
+            pura_buf_putc(out, '>');
+            return;
+        }
+    }
+
+    /* If already prefixed with `struct `, `enum `, `union `, translate tokens directly */
+    if ((len > 7 && memcmp(s, "struct ", 7) == 0) ||
+        (len > 5 && memcmp(s, "enum ", 5) == 0) ||
+        (len > 6 && memcmp(s, "union ", 6) == 0)) {
+        translate_tokens_pura_to_c(out, s, len);
+        return;
+    }
+
+    /* Check if base identifier is a registered struct/enum/union tag */
+    size_t id_len = 0;
+    while (id_len < len && is_ident_cont(s[id_len])) id_len++;
+    if (id_len > 0) {
+        const char *tag_kind = symtab_find_tag_kind(s, id_len);
+        if (tag_kind) {
+            pura_buf_puts(out, tag_kind);
+            pura_buf_putc(out, ' ');
+        }
+    }
+    translate_tokens_pura_to_c(out, s, len);
 }
 
 static bool is_pura_type_word(const char *w, size_t len) {
@@ -694,6 +795,57 @@ static void translate_type_c_to_pura(PuraBuf *out, const char *s, size_t len) {
         return;
     }
 
+    /* C++ container templates -> Pythonic `list[T]`, `set[T]`, `dict[K, V]` */
+    if (len >= 14 && memcmp(s, "std::vector<", 12) == 0 &&
+        find_matching_delim(s, len, 11, '<', '>') == len - 1) {
+        pura_buf_puts(out, "list[");
+        translate_type_c_to_pura(out, s + 12, len - 13);
+        pura_buf_putc(out, ']');
+        return;
+    }
+    if (len >= 11 && memcmp(s, "std::set<", 9) == 0 &&
+        find_matching_delim(s, len, 8, '<', '>') == len - 1) {
+        pura_buf_puts(out, "set[");
+        translate_type_c_to_pura(out, s + 9, len - 10);
+        pura_buf_putc(out, ']');
+        return;
+    }
+    if (len >= 21 && memcmp(s, "std::unordered_set<", 19) == 0 &&
+        find_matching_delim(s, len, 18, '<', '>') == len - 1) {
+        pura_buf_puts(out, "unordered_set[");
+        translate_type_c_to_pura(out, s + 19, len - 20);
+        pura_buf_putc(out, ']');
+        return;
+    }
+    if (len >= 14 && memcmp(s, "std::map<", 9) == 0 &&
+        find_matching_delim(s, len, 8, '<', '>') == len - 1) {
+        const char *inner = s + 9;
+        size_t inner_len = len - 10;
+        size_t comma = find_top_level_comma(inner, inner_len);
+        if (comma < inner_len) {
+            pura_buf_puts(out, "dict[");
+            translate_type_c_to_pura(out, inner, comma);
+            pura_buf_puts(out, ", ");
+            translate_type_c_to_pura(out, inner + comma + 1, inner_len - comma - 1);
+            pura_buf_putc(out, ']');
+            return;
+        }
+    }
+    if (len >= 24 && memcmp(s, "std::unordered_map<", 19) == 0 &&
+        find_matching_delim(s, len, 18, '<', '>') == len - 1) {
+        const char *inner = s + 19;
+        size_t inner_len = len - 20;
+        size_t comma = find_top_level_comma(inner, inner_len);
+        if (comma < inner_len) {
+            pura_buf_puts(out, "unordered_map[");
+            translate_type_c_to_pura(out, inner, comma);
+            pura_buf_puts(out, ", ");
+            translate_type_c_to_pura(out, inner + comma + 1, inner_len - comma - 1);
+            pura_buf_putc(out, ']');
+            return;
+        }
+    }
+
     /* Strip leading `struct `, `enum `, `union ` if the tag was declared in this module */
     if (len > 7 && memcmp(s, "struct ", 7) == 0) {
         const char *tag = s + 7;
@@ -949,6 +1101,41 @@ static void translate_tokens_c_to_pura(PuraBuf *out, const char *s, size_t len) 
     }
 }
 
+/* Find a C array dimension suffix `[N]` on a Pura type, ignoring generic `addr[...]`, `list[...]`, `set[...]`, `dict[...]` */
+static const char *find_pura_c_array_bracket(const char *type_s, size_t type_len) {
+    size_t scan_start = 0;
+    const char *s = type_s;
+    size_t len = type_len;
+    while (len > 0 && s[0] == ' ') { s++; len--; scan_start++; }
+    if (len > 6 && memcmp(s, "const ", 6) == 0) {
+        s += 6; len -= 6; scan_start += 6;
+        while (len > 0 && s[0] == ' ') { s++; len--; scan_start++; }
+    }
+    if ((len >= 6 && memcmp(s, "addr[", 5) == 0) ||
+        (len >= 6 && memcmp(s, "list[", 5) == 0) ||
+        (len >= 6 && memcmp(s, "dict[", 5) == 0)) {
+        size_t close_b = find_matching_delim(type_s, type_len, scan_start + 4, '[', ']');
+        scan_start = (close_b < type_len) ? (close_b + 1) : type_len;
+    } else if (len >= 5 && memcmp(s, "set[", 4) == 0) {
+        size_t close_b = find_matching_delim(type_s, type_len, scan_start + 3, '[', ']');
+        scan_start = (close_b < type_len) ? (close_b + 1) : type_len;
+    } else if ((len >= 15 && memcmp(s, "unordered_set[", 14) == 0) ||
+               (len >= 17 && memcmp(s, "unordered_map[", 14) == 0)) {
+        size_t close_b = find_matching_delim(type_s, type_len, scan_start + 13, '[', ']');
+        scan_start = (close_b < type_len) ? (close_b + 1) : type_len;
+    }
+
+    int depth = 0;
+    for (size_t i = scan_start; i < type_len; i++) {
+        if (type_s[i] == '<' || type_s[i] == '(') depth++;
+        else if (type_s[i] == '>' || type_s[i] == ')') depth--;
+        else if (type_s[i] == '[' && depth == 0) {
+            return type_s + i;
+        }
+    }
+    return NULL;
+}
+
 /* Format `name: type` (including array suffixes like `buf: char[64]`) into C `type name[64]` */
 static void emit_c_typed_decl(PuraBuf *out, const char *name_s, size_t name_len,
                               const char *type_s, size_t type_len) {
@@ -958,19 +1145,7 @@ static void emit_c_typed_decl(PuraBuf *out, const char *name_s, size_t name_len,
     while (type_len > 0 && type_s[0] == ' ') { type_s++; type_len--; }
     while (type_len > 0 && type_s[type_len - 1] == ' ') type_len--;
 
-    /* Check for array dimension on type, e.g. `i32[16]` or `char[64]`, but NOT `addr[T]`! */
-    const char *bracket = NULL;
-    int depth = 0;
-    bool is_addr_type = (type_len >= 6 && memcmp(type_s, "addr[", 5) == 0);
-    for (size_t i = is_addr_type ? 4 : 0; i < type_len; i++) {
-        if (type_s[i] == '<' || type_s[i] == '(' || (is_addr_type && i == 4 && type_s[i] == '[')) depth++;
-        else if (type_s[i] == '>' || type_s[i] == ')' || (is_addr_type && depth > 0 && type_s[i] == ']')) depth--;
-        else if (type_s[i] == '[' && depth == 0) {
-            bracket = type_s + i;
-            break;
-        }
-    }
-
+    const char *bracket = find_pura_c_array_bracket(type_s, type_len);
     size_t base_type_len = bracket ? (size_t)(bracket - type_s) : type_len;
     while (base_type_len > 0 && type_s[base_type_len - 1] == ' ') base_type_len--;
 
@@ -1511,6 +1686,265 @@ static bool try_emit_for_in(PuraBuf *out, const char *expr, size_t len) {
     return true;
 }
 
+static bool is_cpp_std_header(const char *s, size_t len) {
+    static const char *const CPP_HDRS[] = {
+        "vector", "set", "unordered_set", "map", "unordered_map",
+        "string", "string_view", "iostream", "sstream", "fstream",
+        "algorithm", "numeric", "memory", "utility", "functional",
+        "optional", "variant", "tuple", "array", "deque", "list",
+        "queue", "stack", "bitset", "cmath", "cstdint", "cstdio",
+        "cstdlib", "cstring", "cassert", "climits", "cstddef"
+    };
+    for (size_t i = 0; i < sizeof(CPP_HDRS) / sizeof(CPP_HDRS[0]); i++) {
+        if (strlen(CPP_HDRS[i]) == len && memcmp(s, CPP_HDRS[i], len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+typedef enum {
+    COMP_LIST = 0,
+    COMP_SET,
+    COMP_DICT
+} CompKind;
+
+/* Emit C/C++ initialization loop for a Pura list/set/dict comprehension:
+ *   - List: `arr: i32[N] = [expr for i in ... [if cond]]` or `v: list[T] = [expr for x in ... [if cond]]`
+ *   - Set:  `s: bool[N] = {expr for i in ... [if cond]}` or `s: set[T] = {expr for x in ... [if cond]}`
+ *   - Dict: `d: i32[N] = {k: v for i in ... [if cond]}` or `d: dict[K, V] = {k: v for x in ... [if cond]}`
+ * Assumes `emit_c_typed_decl` has already been written to `out` on the current line.
+ */
+static bool try_emit_pura_comprehension(PuraBuf *out,
+                                        const char *lhs, size_t lhs_len,
+                                        const char *ts, size_t tlen,
+                                        const char *val, size_t vlen,
+                                        const char *c_indent, size_t level) {
+    while (vlen > 0 && val[0] == ' ') { val++; vlen--; }
+    while (vlen > 0 && val[vlen - 1] == ' ') vlen--;
+    if (vlen < 2) return false;
+
+    bool is_bracket = false;
+    if (val[0] == '[' && find_matching_delim(val, vlen, 0, '[', ']') == vlen - 1) {
+        is_bracket = true;
+    } else if (val[0] == '{' && find_matching_delim(val, vlen, 0, '{', '}') == vlen - 1) {
+        is_bracket = false;
+    } else {
+        return false;
+    }
+
+    const char *inner = val + 1;
+    size_t inner_len = vlen - 2;
+
+    /* Find top-level ` for ` inside `[...]` or `{...}` */
+    size_t for_idx = inner_len;
+    int depth = 0;
+    char quote = 0;
+    for (size_t i = 0; i + 5 <= inner_len; i++) {
+        char c = inner[i];
+        if (quote) {
+            if (c == '\\' && i + 1 < inner_len) i++;
+            else if (c == quote) quote = 0;
+            continue;
+        }
+        if (c == '"' || c == '\'') quote = c;
+        else if (c == '(' || c == '[' || c == '{') depth++;
+        else if (c == ')' || c == ']' || c == '}') depth--;
+        else if (depth == 0 && memcmp(inner + i, " for ", 5) == 0) {
+            for_idx = i;
+            break;
+        }
+    }
+    if (for_idx >= inner_len) return false;
+
+    const char *head = inner;
+    size_t head_len = for_idx;
+    while (head_len > 0 && head[0] == ' ') { head++; head_len--; }
+    while (head_len > 0 && head[head_len - 1] == ' ') head_len--;
+    if (head_len == 0) return false;
+
+    const char *after_for = inner + for_idx + 5;
+    size_t after_for_len = inner_len - (for_idx + 5);
+
+    /* Find top-level ` in ` and optional ` if ` in `after_for` */
+    size_t in_idx = after_for_len;
+    size_t if_idx = after_for_len;
+    depth = 0;
+    quote = 0;
+    for (size_t i = 0; i < after_for_len; i++) {
+        char c = after_for[i];
+        if (quote) {
+            if (c == '\\' && i + 1 < after_for_len) i++;
+            else if (c == quote) quote = 0;
+            continue;
+        }
+        if (c == '"' || c == '\'') quote = c;
+        else if (c == '(' || c == '[' || c == '{') depth++;
+        else if (c == ')' || c == ']' || c == '}') depth--;
+        else if (depth == 0) {
+            if (in_idx == after_for_len && i + 4 <= after_for_len && memcmp(after_for + i, " in ", 4) == 0) {
+                in_idx = i;
+            } else if (in_idx < after_for_len && i + 4 <= after_for_len && memcmp(after_for + i, " if ", 4) == 0) {
+                if_idx = i;
+                break;
+            }
+        }
+    }
+    if (in_idx >= after_for_len) return false;
+
+    const char *for_clause = after_for;
+    size_t for_clause_len = (if_idx < after_for_len) ? if_idx : after_for_len;
+    while (for_clause_len > 0 && for_clause[0] == ' ') { for_clause++; for_clause_len--; }
+    while (for_clause_len > 0 && for_clause[for_clause_len - 1] == ' ') for_clause_len--;
+
+    const char *cond_s = NULL;
+    size_t cond_len = 0;
+    if (if_idx < after_for_len) {
+        cond_s = after_for + if_idx + 4;
+        cond_len = after_for_len - (if_idx + 4);
+        while (cond_len > 0 && cond_s[0] == ' ') { cond_s++; cond_len--; }
+        while (cond_len > 0 && cond_s[cond_len - 1] == ' ') cond_len--;
+        if (cond_len == 0) return false;
+    }
+
+    /* Extract loop variable name from `after_for[0..in_idx]` */
+    const char *vname = after_for;
+    size_t vname_len = in_idx;
+    while (vname_len > 0 && vname[0] == ' ') { vname++; vname_len--; }
+    for (size_t i = 0; i < vname_len; i++) {
+        if (vname[i] == ':') {
+            vname_len = i;
+            break;
+        }
+    }
+    while (vname_len > 0 && vname[vname_len - 1] == ' ') vname_len--;
+    if (vname_len == 0) return false;
+
+    CompKind kind = COMP_LIST;
+    const char *key_s = NULL;
+    size_t key_len = 0;
+    const char *elem_s = head;
+    size_t elem_len = head_len;
+
+    if (!is_bracket) {
+        /* Distinguish `{k: v for ...}` (dict) from `{elem for ...}` (set) */
+        size_t colon_idx = head_len;
+        depth = 0;
+        quote = 0;
+        int qmark_depth = 0;
+        for (size_t i = 0; i < head_len; i++) {
+            char c = head[i];
+            if (quote) {
+                if (c == '\\' && i + 1 < head_len) i++;
+                else if (c == quote) quote = 0;
+                continue;
+            }
+            if (c == '"' || c == '\'') quote = c;
+            else if (c == '(' || c == '[' || c == '{') depth++;
+            else if (c == ')' || c == ']' || c == '}') depth--;
+            else if (depth == 0) {
+                if (c == '?') {
+                    qmark_depth++;
+                } else if (c == ':') {
+                    if (i + 1 < head_len && head[i + 1] == ':') {
+                        i++; /* skip :: */
+                    } else if (qmark_depth > 0) {
+                        qmark_depth--;
+                    } else {
+                        colon_idx = i;
+                        break;
+                    }
+                }
+            }
+        }
+        if (colon_idx < head_len) {
+            kind = COMP_DICT;
+            key_s = head;
+            key_len = colon_idx;
+            while (key_len > 0 && key_s[0] == ' ') { key_s++; key_len--; }
+            while (key_len > 0 && key_s[key_len - 1] == ' ') key_len--;
+            elem_s = head + colon_idx + 1;
+            elem_len = head_len - (colon_idx + 1);
+            while (elem_len > 0 && elem_s[0] == ' ') { elem_s++; elem_len--; }
+            while (elem_len > 0 && elem_s[elem_len - 1] == ' ') elem_len--;
+            if (key_len == 0 || elem_len == 0) return false;
+        } else {
+            kind = COMP_SET;
+        }
+    }
+
+    bool is_c_array = (find_pura_c_array_bracket(ts, tlen) != NULL);
+
+    /* Finish the declaration line */
+    if (is_c_array && (kind == COMP_SET || kind == COMP_DICT)) {
+        pura_buf_puts(out, " = {0};\n");
+    } else {
+        pura_buf_puts(out, ";\n");
+    }
+
+    /* Emit `for (...) {` */
+    size_t c_indent_len = strlen(c_indent);
+    pura_buf_indent(out, c_indent, c_indent_len, level);
+    if (!try_emit_for_in(out, for_clause, for_clause_len)) {
+        pura_buf_puts(out, "for (");
+        translate_tokens_pura_to_c(out, for_clause, for_clause_len);
+        pura_buf_puts(out, ") {");
+    }
+    pura_buf_putc(out, '\n');
+
+    /* Optional `if (cond) {` filter */
+    if (cond_s) {
+        pura_buf_indent(out, c_indent, c_indent_len, level + 1);
+        pura_buf_puts(out, "if (");
+        translate_tokens_pura_to_c(out, cond_s, cond_len);
+        pura_buf_puts(out, ") {\n");
+    }
+
+    /* Emit body statement */
+    size_t body_level = level + (cond_s ? 2 : 1);
+    pura_buf_indent(out, c_indent, c_indent_len, body_level);
+    translate_tokens_pura_to_c(out, lhs, lhs_len);
+
+    if (kind == COMP_LIST) {
+        if (is_c_array) {
+            pura_buf_putc(out, '[');
+            translate_tokens_pura_to_c(out, vname, vname_len);
+            pura_buf_puts(out, "] = ");
+            translate_tokens_pura_to_c(out, elem_s, elem_len);
+            pura_buf_puts(out, ";\n");
+        } else {
+            pura_buf_puts(out, ".push_back(");
+            translate_tokens_pura_to_c(out, elem_s, elem_len);
+            pura_buf_puts(out, ");\n");
+        }
+    } else if (kind == COMP_SET) {
+        if (is_c_array) {
+            pura_buf_putc(out, '[');
+            translate_tokens_pura_to_c(out, elem_s, elem_len);
+            pura_buf_puts(out, "] = true;\n");
+        } else {
+            pura_buf_puts(out, ".insert(");
+            translate_tokens_pura_to_c(out, elem_s, elem_len);
+            pura_buf_puts(out, ");\n");
+        }
+    } else {
+        pura_buf_putc(out, '[');
+        translate_tokens_pura_to_c(out, key_s, key_len);
+        pura_buf_puts(out, "] = ");
+        translate_tokens_pura_to_c(out, elem_s, elem_len);
+        pura_buf_puts(out, ";\n");
+    }
+
+    if (cond_s) {
+        pura_buf_indent(out, c_indent, c_indent_len, level + 1);
+        pura_buf_puts(out, "}\n");
+    }
+
+    pura_buf_indent(out, c_indent, c_indent_len, level);
+    pura_buf_putc(out, '}');
+    return true;
+}
+
 static void close_block_frame(PuraBuf *out, BlockFrame frame, const char *c_indent) {
     if (frame.kind == BLOCK_CASE) {
         return; /* case blocks don't emit a closing '}' in C */
@@ -1750,8 +2184,8 @@ char *pura_to_c(const char *src, size_t len, PuraError *err, size_t *out_len) {
             pura_buf_puts(&out, "#include ");
             if (ilen > 0 && (imp[0] == '<' || imp[0] == '"')) {
                 pura_buf_append(&out, imp, ilen);
-            } else if (memchr(imp, '.', ilen) != NULL) {
-                /* Explicit extension (.h, .c, .hpp): untranspiled C/C++ header/file */
+            } else if (memchr(imp, '.', ilen) != NULL || is_cpp_std_header(imp, ilen)) {
+                /* Explicit extension (.h, .c, .hpp) or C++ std header: system header */
                 pura_buf_putc(&out, '<');
                 pura_buf_append(&out, imp, ilen);
                 pura_buf_putc(&out, '>');
@@ -2196,10 +2630,14 @@ char *pura_to_c(const char *src, size_t len, PuraError *err, size_t *out_len) {
                 const char *val = decl_eq + 1;
                 size_t vlen = code_len - (size_t)(val - content);
                 while (vlen > 0 && val[0] == ' ') { val++; vlen--; }
-                pura_buf_puts(&out, " = ");
-                translate_tokens_pura_to_c(&out, val, vlen);
+                if (!try_emit_pura_comprehension(&out, lhs, lhs_len, ts, tlen, val, vlen, c_indent, level)) {
+                    pura_buf_puts(&out, " = ");
+                    translate_tokens_pura_to_c(&out, val, vlen);
+                    pura_buf_putc(&out, ';');
+                }
+            } else {
+                pura_buf_putc(&out, ';');
             }
-            pura_buf_putc(&out, ';');
         } else if (level == 0 && try_emit_pura_macro_define(&out, content, code_len)) {
             /* Root-level Pythonic constant/macro assignment:
              *   `MAX_SIZE = 1024`         -> `#define MAX_SIZE 1024`
@@ -2483,10 +2921,10 @@ static bool try_emit_c_var_decl_to_pura(PuraBuf *out, const char *s, size_t len)
     while (type_end > 0 && lhs[type_end - 1] == ' ') type_end--;
     if (type_end == 0) return false;
 
-    /* Verify type part looks like a valid type (alphanumeric, `_`, `*`, `&`, ` `, `:`, `<`, `>`) */
+    /* Verify type part looks like a valid type (alphanumeric, `_`, `*`, `&`, ` `, `:`, `<`, `>`, `,`) */
     for (size_t i = 0; i < type_end; i++) {
         char c = lhs[i];
-        if (!is_ident_cont(c) && c != ' ' && c != '*' && c != '&' && c != ':' && c != '<' && c != '>') {
+        if (!is_ident_cont(c) && c != ' ' && c != '*' && c != '&' && c != ':' && c != '<' && c != '>' && c != ',') {
             return false;
         }
     }
@@ -2512,9 +2950,10 @@ static bool try_emit_c_var_decl_to_pura(PuraBuf *out, const char *s, size_t len)
 }
 
 /* Try to convert a C 3-clause `for (T i = start; i < stop; i++)` into Pythonic `for i in range(...)` */
-static bool try_emit_c_for_range_to_pura(PuraBuf *out, const char *init_s, size_t init_len,
-                                           const char *cond_s, size_t cond_len,
-                                           const char *step_s, size_t step_len) {
+static bool try_emit_c_for_range_to_pura_ex(PuraBuf *out, const char *init_s, size_t init_len,
+                                            const char *cond_s, size_t cond_len,
+                                            const char *step_s, size_t step_len,
+                                            const char **out_vname, size_t *out_vlen) {
     while (init_len > 0 && init_s[0] == ' ') { init_s++; init_len--; }
     while (init_len > 0 && init_s[init_len - 1] == ' ') init_len--;
     while (cond_len > 0 && cond_s[0] == ' ') { cond_s++; cond_len--; }
@@ -2624,6 +3063,368 @@ static bool try_emit_c_for_range_to_pura(PuraBuf *out, const char *init_s, size_
         }
     }
     pura_buf_putc(out, ')');
+    if (out_vname) *out_vname = vname;
+    if (out_vlen) *out_vlen = vlen;
+    return true;
+}
+
+static bool try_emit_c_for_range_to_pura(PuraBuf *out, const char *init_s, size_t init_len,
+                                         const char *cond_s, size_t cond_len,
+                                         const char *step_s, size_t step_len) {
+    return try_emit_c_for_range_to_pura_ex(out, init_s, init_len, cond_s, cond_len, step_s, step_len, NULL, NULL);
+}
+
+/* Try to convert a C++ range-based `for (auto x : iter)` or `for (T x : iter)` into `x in iter` */
+static bool try_emit_c_for_in_to_pura(PuraBuf *out, const char *cond, size_t clen,
+                                      const char **out_vname, size_t *out_vlen) {
+    while (clen > 0 && cond[0] == ' ') { cond++; clen--; }
+    while (clen > 0 && cond[clen - 1] == ' ') clen--;
+
+    size_t colon_idx = clen;
+    int depth = 0;
+    char quote = 0;
+    for (size_t i = 0; i < clen; i++) {
+        char c = cond[i];
+        if (quote) {
+            if (c == '\\' && i + 1 < clen) i++;
+            else if (c == quote) quote = 0;
+            continue;
+        }
+        if (c == '"' || c == '\'') quote = c;
+        else if (c == '(' || c == '[' || c == '{' || c == '<') depth++;
+        else if (c == ')' || c == ']' || c == '}' || c == '>') depth--;
+        else if (depth == 0 && c == ':') {
+            if (i + 1 < clen && cond[i + 1] == ':') {
+                i++;
+                continue;
+            }
+            colon_idx = i;
+            break;
+        }
+    }
+    if (colon_idx >= clen) return false;
+
+    const char *lhs = cond;
+    size_t lhs_len = colon_idx;
+    while (lhs_len > 0 && lhs[0] == ' ') { lhs++; lhs_len--; }
+    while (lhs_len > 0 && lhs[lhs_len - 1] == ' ') lhs_len--;
+
+    const char *rhs = cond + colon_idx + 1;
+    size_t rhs_len = clen - (colon_idx + 1);
+    while (rhs_len > 0 && rhs[0] == ' ') { rhs++; rhs_len--; }
+    while (rhs_len > 0 && rhs[rhs_len - 1] == ' ') rhs_len--;
+    if (lhs_len == 0 || rhs_len == 0) return false;
+
+    size_t v_end = lhs_len;
+    size_t v_start = v_end;
+    while (v_start > 0 && is_ident_cont(lhs[v_start - 1])) v_start--;
+    if (v_start == 0 || v_start == v_end) return false;
+
+    size_t type_len = v_start;
+    while (type_len > 0 && lhs[type_len - 1] == ' ') type_len--;
+    if (type_len == 0) return false;
+
+    const char *vname = lhs + v_start;
+    size_t vlen = v_end - v_start;
+
+    pura_buf_append(out, vname, vlen);
+    if (!(type_len == 4 && memcmp(lhs, "auto", 4) == 0)) {
+        pura_buf_puts(out, ": ");
+        translate_type_c_to_pura(out, lhs, type_len);
+    }
+    pura_buf_puts(out, " in ");
+    translate_tokens_c_to_pura(out, rhs, rhs_len);
+
+    if (out_vname) *out_vname = vname;
+    if (out_vlen) *out_vlen = vlen;
+    return true;
+}
+
+static bool next_trimmed_c_line(const char *src, size_t len, size_t *cursor,
+                                const char **out_line, size_t *out_len) {
+    size_t p = *cursor;
+    if (p >= len) return false;
+    size_t ls = p;
+    while (p < len && src[p] != '\n' && src[p] != '\r') p++;
+    size_t le = p;
+    if (p < len) {
+        if (src[p] == '\r' && p + 1 < len && src[p + 1] == '\n') p += 2;
+        else p++;
+    }
+    while (ls < le && (src[ls] == ' ' || src[ls] == '\t')) ls++;
+    while (le > ls && (src[le - 1] == ' ' || src[le - 1] == '\t')) le--;
+    *cursor = p;
+    *out_line = src + ls;
+    *out_len = le - ls;
+    return true;
+}
+
+/* Try to fold a C/C++ container or array declaration + initialization loop back into
+ * a Pura list, set, or dict comprehension. Advances `*io_p` past the loop if matched.
+ */
+static bool try_emit_c_comprehension_to_pura(PuraBuf *out,
+                                             const char *decl_line, size_t decl_len,
+                                             const char *src, size_t src_len,
+                                             size_t *io_p) {
+    /* Split declaration at top-level `=` if present */
+    const char *eq = NULL;
+    int depth = 0;
+    char quote = 0;
+    for (size_t i = 0; i < decl_len; i++) {
+        char c = decl_line[i];
+        if (quote) {
+            if (c == '\\' && i + 1 < decl_len) i++;
+            else if (c == quote) quote = 0;
+            continue;
+        }
+        if (c == '"' || c == '\'') quote = c;
+        else if (c == '(' || c == '[' || c == '{' || c == '<') depth++;
+        else if (c == ')' || c == ']' || c == '}' || c == '>') depth--;
+        else if (depth == 0 && c == '=') {
+            eq = decl_line + i;
+            break;
+        }
+    }
+
+    bool has_zero_init = false;
+    size_t lhs_len = eq ? (size_t)(eq - decl_line) : decl_len;
+    while (lhs_len > 0 && decl_line[lhs_len - 1] == ' ') lhs_len--;
+    if (lhs_len == 0) return false;
+
+    if (eq) {
+        const char *rhs = eq + 1;
+        size_t rhs_len = decl_len - (size_t)(rhs - decl_line);
+        while (rhs_len > 0 && rhs[0] == ' ') { rhs++; rhs_len--; }
+        while (rhs_len > 0 && rhs[rhs_len - 1] == ' ') rhs_len--;
+        if (rhs_len == 3 && memcmp(rhs, "{0}", 3) == 0) {
+            has_zero_init = true;
+        } else {
+            return false;
+        }
+    }
+
+    if (memchr(decl_line, '(', lhs_len) != NULL) return false;
+
+    const char *bracket = memchr(decl_line, '[', lhs_len);
+    size_t pre_bracket = bracket ? (size_t)(bracket - decl_line) : lhs_len;
+    while (pre_bracket > 0 && decl_line[pre_bracket - 1] == ' ') pre_bracket--;
+
+    size_t name_end = pre_bracket;
+    size_t name_start = name_end;
+    while (name_start > 0 && is_ident_cont(decl_line[name_start - 1])) name_start--;
+    if (name_start == 0 || name_start == name_end) return false;
+
+    const char *var_name = decl_line + name_start;
+    size_t var_len = name_end - name_start;
+
+    size_t type_end = name_start;
+    while (type_end > 0 && decl_line[type_end - 1] == ' ') type_end--;
+    if (type_end == 0) return false;
+
+    bool is_c_array = (bracket != NULL);
+    bool is_bool_array = is_c_array && (type_end == 4 && memcmp(decl_line, "bool", 4) == 0);
+    bool is_cpp_vec = !is_c_array && !has_zero_init &&
+                      (type_end > 13 && memcmp(decl_line, "std::vector<", 12) == 0 && decl_line[type_end - 1] == '>');
+    bool is_cpp_set = !is_c_array && !has_zero_init &&
+                      ((type_end > 10 && memcmp(decl_line, "std::set<", 9) == 0 && decl_line[type_end - 1] == '>') ||
+                       (type_end > 20 && memcmp(decl_line, "std::unordered_set<", 19) == 0 && decl_line[type_end - 1] == '>'));
+    bool is_cpp_map = !is_c_array && !has_zero_init &&
+                      ((type_end > 10 && memcmp(decl_line, "std::map<", 9) == 0 && decl_line[type_end - 1] == '>') ||
+                       (type_end > 20 && memcmp(decl_line, "std::unordered_map<", 19) == 0 && decl_line[type_end - 1] == '>'));
+
+    if (!is_c_array && !is_cpp_vec && !is_cpp_set && !is_cpp_map) return false;
+
+    /* Peek at following lines for `for (...) { [if (...) {] <stmt>; [}] }` */
+    size_t scan_p = *io_p;
+    const char *for_line = NULL;
+    size_t for_llen = 0;
+    if (!next_trimmed_c_line(src, src_len, &scan_p, &for_line, &for_llen)) return false;
+    if (for_llen == 0 || for_line[for_llen - 1] != '{') return false;
+
+    size_t kw_after = 0;
+    if (!starts_with_kw(for_line, for_llen - 1, "for", &kw_after)) return false;
+    const char *for_cond = for_line + kw_after;
+    size_t for_clen = (for_llen - 1) - kw_after;
+    while (for_clen > 0 && for_cond[for_clen - 1] == ' ') for_clen--;
+    if (for_clen < 2 || for_cond[0] != '(' || for_cond[for_clen - 1] != ')') return false;
+    for_cond++;
+    for_clen -= 2;
+
+    PuraBuf for_buf;
+    if (!pura_buf_init(&for_buf, 64)) return false;
+    const char *loop_vname = NULL;
+    size_t loop_vlen = 0;
+    bool for_ok = false;
+    const char *semi1 = memchr(for_cond, ';', for_clen);
+    const char *semi2 = semi1 ? memchr(semi1 + 1, ';', for_clen - (size_t)(semi1 + 1 - for_cond)) : NULL;
+    if (semi1 && semi2) {
+        size_t init_len = (size_t)(semi1 - for_cond);
+        const char *c2 = semi1 + 1;
+        size_t c2_len = (size_t)(semi2 - c2);
+        const char *c3 = semi2 + 1;
+        size_t c3_len = for_clen - (size_t)(c3 - for_cond);
+        for_ok = try_emit_c_for_range_to_pura_ex(&for_buf, for_cond, init_len,
+                                                 c2, c2_len, c3, c3_len,
+                                                 &loop_vname, &loop_vlen);
+    } else {
+        for_ok = try_emit_c_for_in_to_pura(&for_buf, for_cond, for_clen, &loop_vname, &loop_vlen);
+    }
+    if (!for_ok || !loop_vname || loop_vlen == 0) {
+        pura_buf_free(&for_buf);
+        return false;
+    }
+
+    const char *line2 = NULL;
+    size_t len2 = 0;
+    if (!next_trimmed_c_line(src, src_len, &scan_p, &line2, &len2) || len2 == 0) {
+        pura_buf_free(&for_buf);
+        return false;
+    }
+
+    const char *if_cond = NULL;
+    size_t if_clen = 0;
+    const char *stmt_line = line2;
+    size_t stmt_len = len2;
+
+    if (line2[len2 - 1] == '{' && starts_with_kw(line2, len2 - 1, "if", &kw_after)) {
+        if_cond = line2 + kw_after;
+        if_clen = (len2 - 1) - kw_after;
+        while (if_clen > 0 && if_cond[if_clen - 1] == ' ') if_clen--;
+        if (if_clen < 2 || if_cond[0] != '(' || if_cond[if_clen - 1] != ')') {
+            pura_buf_free(&for_buf);
+            return false;
+        }
+        if_cond++;
+        if_clen -= 2;
+
+        if (!next_trimmed_c_line(src, src_len, &scan_p, &stmt_line, &stmt_len) || stmt_len == 0) {
+            pura_buf_free(&for_buf);
+            return false;
+        }
+    }
+
+    /* Statement must end with `;` and have no trailing comment */
+    if (stmt_len < var_len + 4 || stmt_line[stmt_len - 1] != ';') {
+        pura_buf_free(&for_buf);
+        return false;
+    }
+    stmt_len--;
+    while (stmt_len > 0 && stmt_line[stmt_len - 1] == ' ') stmt_len--;
+
+    /* Verify closing brace(s) immediately follow */
+    const char *close_line = NULL;
+    size_t close_len = 0;
+    if (if_cond) {
+        if (!next_trimmed_c_line(src, src_len, &scan_p, &close_line, &close_len) ||
+            close_len != 1 || close_line[0] != '}') {
+            pura_buf_free(&for_buf);
+            return false;
+        }
+    }
+    if (!next_trimmed_c_line(src, src_len, &scan_p, &close_line, &close_len) ||
+        close_len != 1 || close_line[0] != '}') {
+        pura_buf_free(&for_buf);
+        return false;
+    }
+
+    /* Statement must start with `var_name` */
+    if (stmt_len <= var_len || memcmp(stmt_line, var_name, var_len) != 0) {
+        pura_buf_free(&for_buf);
+        return false;
+    }
+
+    const char *after_var = stmt_line + var_len;
+    size_t after_var_len = stmt_len - var_len;
+
+    CompKind kind = COMP_LIST;
+    const char *key_s = NULL;
+    size_t key_len = 0;
+    const char *elem_s = NULL;
+    size_t elem_len = 0;
+    bool matched = false;
+
+    if (is_cpp_vec && after_var_len > 12 && memcmp(after_var, ".push_back(", 11) == 0 &&
+        after_var[after_var_len - 1] == ')') {
+        kind = COMP_LIST;
+        elem_s = after_var + 11;
+        elem_len = after_var_len - 12;
+        matched = true;
+    } else if (is_cpp_set && after_var_len > 9 && memcmp(after_var, ".insert(", 8) == 0 &&
+               after_var[after_var_len - 1] == ')') {
+        kind = COMP_SET;
+        elem_s = after_var + 8;
+        elem_len = after_var_len - 9;
+        matched = true;
+    } else if (after_var_len > 4 && after_var[0] == '[') {
+        size_t close_b = find_matching_delim(after_var, after_var_len, 0, '[', ']');
+        if (close_b > 1 && close_b + 1 < after_var_len) {
+            const char *idx_s = after_var + 1;
+            size_t idx_len = close_b - 1;
+            while (idx_len > 0 && idx_s[0] == ' ') { idx_s++; idx_len--; }
+            while (idx_len > 0 && idx_s[idx_len - 1] == ' ') idx_len--;
+
+            const char *rest = after_var + close_b + 1;
+            size_t rest_len = after_var_len - (close_b + 1);
+            while (rest_len > 0 && rest[0] == ' ') { rest++; rest_len--; }
+            if (rest_len > 1 && rest[0] == '=' && rest[1] != '=') {
+                const char *val_s = rest + 1;
+                size_t val_len = rest_len - 1;
+                while (val_len > 0 && val_s[0] == ' ') { val_s++; val_len--; }
+                while (val_len > 0 && val_s[val_len - 1] == ' ') val_len--;
+
+                if (is_c_array && !has_zero_init &&
+                    idx_len == loop_vlen && memcmp(idx_s, loop_vname, loop_vlen) == 0) {
+                    kind = COMP_LIST;
+                    elem_s = val_s;
+                    elem_len = val_len;
+                    matched = true;
+                } else if (is_bool_array && has_zero_init &&
+                           val_len == 4 && memcmp(val_s, "true", 4) == 0) {
+                    kind = COMP_SET;
+                    elem_s = idx_s;
+                    elem_len = idx_len;
+                    matched = true;
+                } else if ((is_c_array && has_zero_init) || is_cpp_map) {
+                    kind = COMP_DICT;
+                    key_s = idx_s;
+                    key_len = idx_len;
+                    elem_s = val_s;
+                    elem_len = val_len;
+                    matched = true;
+                }
+            }
+        }
+    }
+
+    if (!matched || elem_len == 0) {
+        pura_buf_free(&for_buf);
+        return false;
+    }
+
+    /* Emit `<var_name>: <pura_type> = [ / { ... ] / }` */
+    pura_buf_append(out, var_name, var_len);
+    pura_buf_puts(out, ": ");
+    translate_type_c_to_pura(out, decl_line, type_end);
+    if (bracket) {
+        translate_tokens_c_to_pura(out, bracket, lhs_len - (size_t)(bracket - decl_line));
+    }
+    pura_buf_puts(out, " = ");
+    pura_buf_putc(out, (kind == COMP_LIST) ? '[' : '{');
+    if (kind == COMP_DICT) {
+        translate_tokens_c_to_pura(out, key_s, key_len);
+        pura_buf_puts(out, ": ");
+    }
+    translate_tokens_c_to_pura(out, elem_s, elem_len);
+    pura_buf_puts(out, " for ");
+    pura_buf_append(out, for_buf.data, for_buf.len);
+    if (if_cond) {
+        pura_buf_puts(out, " if ");
+        translate_tokens_c_to_pura(out, if_cond, if_clen);
+    }
+    pura_buf_putc(out, (kind == COMP_LIST) ? ']' : '}');
+
+    pura_buf_free(&for_buf);
+    *io_p = scan_p;
     return true;
 }
 
@@ -2882,7 +3683,7 @@ char *pura_from_c_indent(const char *src, size_t len, const char *indent_unit,
                         while (c3_len > 0 && *c3 == ' ') { c3++; c3_len--; }
                         translate_tokens_c_to_pura(&out, c3, c3_len);
                     }
-                } else {
+                } else if (!try_emit_c_for_in_to_pura(&out, cond, clen, NULL, NULL)) {
                     translate_tokens_c_to_pura(&out, cond, clen);
                 }
                 pura_buf_putc(&out, ':');
@@ -2950,6 +3751,7 @@ char *pura_from_c_indent(const char *src, size_t len, const char *indent_unit,
                 translate_tokens_c_to_pura(&out, line, code_len);
             }
         } else if (!try_emit_c_func_to_pura(&out, line, code_len, false) &&
+                   !(inline_comment == NULL && try_emit_c_comprehension_to_pura(&out, line, code_len, src, len, &p)) &&
                    !try_emit_c_var_decl_to_pura(&out, line, code_len)) {
             translate_tokens_c_to_pura(&out, line, code_len);
         }
@@ -3062,7 +3864,23 @@ static int run_tests(void) {
         "\t\t\tval(out_code) = OK\n"
         "\t\t\treturn true\n"
         "\t\tdefault:\n"
-        "\t\t\treturn false\n"
+        "\t\t\treturn false\n",
+
+        /* List, set, and dict comprehensions (C fixed-size arrays and C++ containers) */
+        "import stdint.h\n"
+        "import stdbool.h\n"
+        "import vector\n"
+        "import set\n"
+        "import map\n"
+        "\n"
+        "def test_comprehensions() -> i32:\n"
+        "    squares: i32[8] = [i * i for i in range(8)]\n"
+        "    evens: bool[16] = {i for i in range(16) if i % 2 == 0}\n"
+        "    table: i32[8] = {i: i * 10 for i in range(8) if i > 0}\n"
+        "    vec: list[i32] = [x * 2 for x in squares if x > 0]\n"
+        "    uniq: set[i32] = {x for x in vec}\n"
+        "    mapping: dict[i32, i32] = {x: x + 1 for x in uniq if x < 100}\n"
+        "    return table[2] + squares[3]\n"
     };
 
     const char *indents[] = {"  ", "    ", "\t"};
@@ -3125,6 +3943,83 @@ static int run_tests(void) {
             return 1;
         }
         free(c_out);
+        passed++;
+    }
+
+    /* Exact comprehension C/C++ codegen & bidirectional round-trip test */
+    {
+        const char *comp_pura =
+            "def demo():\n"
+            "    squares: i32[8] = [i * i for i in range(8)]\n"
+            "    evens: bool[16] = {i for i in range(16) if i % 2 == 0}\n"
+            "    table: i32[8] = {i: i * 10 for i in range(8) if i > 0}\n"
+            "    vec: list[i32] = [x * 2 for x in squares if x > 0]\n"
+            "    uniq: set[i32] = {x for x in vec}\n"
+            "    mapping: dict[i32, i32] = {x: x + 1 for x in uniq if x < 100}\n";
+        const char *expected_c =
+            "void demo(void) {\n"
+            "    int32_t squares[8];\n"
+            "    for (int32_t i = 0; i < 8; i++) {\n"
+            "        squares[i] = i * i;\n"
+            "    }\n"
+            "    bool evens[16] = {0};\n"
+            "    for (int32_t i = 0; i < 16; i++) {\n"
+            "        if (i % 2 == 0) {\n"
+            "            evens[i] = true;\n"
+            "        }\n"
+            "    }\n"
+            "    int32_t table[8] = {0};\n"
+            "    for (int32_t i = 0; i < 8; i++) {\n"
+            "        if (i > 0) {\n"
+            "            table[i] = i * 10;\n"
+            "        }\n"
+            "    }\n"
+            "    std::vector<int32_t> vec;\n"
+            "    for (auto x : squares) {\n"
+            "        if (x > 0) {\n"
+            "            vec.push_back(x * 2);\n"
+            "        }\n"
+            "    }\n"
+            "    std::set<int32_t> uniq;\n"
+            "    for (auto x : vec) {\n"
+            "        uniq.insert(x);\n"
+            "    }\n"
+            "    std::map<int32_t, int32_t> mapping;\n"
+            "    for (auto x : uniq) {\n"
+            "        if (x < 100) {\n"
+            "            mapping[x] = x + 1;\n"
+            "        }\n"
+            "    }\n"
+            "}\n";
+        PuraError err;
+        size_t c_len = 0;
+        char *c_out = pura_to_c(comp_pura, strlen(comp_pura), &err, &c_len);
+        if (!c_out) {
+            fprintf(stderr, "FAIL [comprehensions pura_to_c]: %s (line %zu)\n", err.message, err.line);
+            return 1;
+        }
+        if (strcmp(c_out, expected_c) != 0) {
+            fprintf(stderr, "FAIL [comprehensions C output]\n--- Expected ---\n%s--- Got ---\n%s",
+                    expected_c, c_out);
+            free(c_out);
+            return 1;
+        }
+        size_t pu_len = 0;
+        char *pu_out = pura_from_c_indent(c_out, c_len, "    ", &err, &pu_len);
+        if (!pu_out) {
+            fprintf(stderr, "FAIL [comprehensions pura_from_c]: %s\n", err.message);
+            free(c_out);
+            return 1;
+        }
+        if (strcmp(pu_out, comp_pura) != 0) {
+            fprintf(stderr, "FAIL [comprehensions Pura roundtrip]\n--- Expected ---\n%s--- Got ---\n%s",
+                    comp_pura, pu_out);
+            free(c_out);
+            free(pu_out);
+            return 1;
+        }
+        free(c_out);
+        free(pu_out);
         passed++;
     }
 

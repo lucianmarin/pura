@@ -8,8 +8,9 @@ MAX_GREETINGS = 3
 def greet(name: cstr, count: i32) -> i32:
     if name == nil or count <= 0:
         return 0
+    steps: i32[MAX_GREETINGS] = [i + 1 for i in range(MAX_GREETINGS)]
     for i in range(count):
-        printf("[%d] Hello from Pura, %s!\n", i + 1, name)
+        printf("[%d] Hello from Pura, %s!\n", steps[i], name)
     return count
 
 def main() -> i32:
