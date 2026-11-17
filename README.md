@@ -473,7 +473,7 @@ c_header_file  = path_stem "." ( "h" | "c" | "hpp" ) ; (* Explicit extension: re
 # Build the pura binary
 make
 
-# Install to Homebrew prefix (or /usr/local/bin)
+# Install to ~/.local/bin if ~/.local exists (otherwise /usr/local/bin)
 make install
 
 # Transpile a .pura file to C/C++ on stdout
