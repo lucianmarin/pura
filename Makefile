@@ -1,7 +1,7 @@
 CC ?= cc
 CFLAGS ?= -O3 -std=c11 -Wall -Wextra
 
-PREFIX ?= $(shell if [ -d "$(HOME)/.local" ]; then echo "$(HOME)/.local"; else echo /usr/local; fi)
+PREFIX ?= $(if $(wildcard $(HOME)/.local),$(HOME)/.local,/usr/local)
 BINDIR ?= $(DESTDIR)$(PREFIX)/bin
 
 TARGET = pura
