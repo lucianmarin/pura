@@ -473,8 +473,9 @@ c_header_file  = path_stem "." ( "h" | "c" | "hpp" ) ; (* Explicit extension: re
 # Build the pura binary
 make
 
-# Install to ~/.local/bin if ~/.local exists (otherwise /usr/local/bin)
+# Install to /usr/local/bin with sudo, otherwise to ~/.local/bin
 make install
+sudo make install
 
 # Transpile a .pura file to C/C++ on stdout
 ./pura examples/hello.pura
